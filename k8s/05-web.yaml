@@ -1,0 +1,86 @@
+# Static client, plus the nginx that fronts /api. Cheap and stateless, so it
+# scales freely and needs no storage.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voxdocs-web
+  namespace: voxdocs
+  labels:
+    app: voxdocs-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: voxdocs-web
+  template:
+    metadata:
+      labels:
+        app: voxdocs-web
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/voxdocs/web:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            - name: VOXDOCS_API_HOST
+              value: voxdocs-api
+            - name: VOXDOCS_API_PORT
+              value: "3000"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: 64Mi
+            limits:
+              cpu: "500m"
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voxdocs-web
+  namespace: voxdocs
+spec:
+  selector:
+    app: voxdocs-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voxdocs
+  namespace: voxdocs
+  annotations:
+    # Media uploads are large and renders are slow; the defaults are far too
+    # tight for both.
+    nginx.ingress.kubernetes.io/proxy-body-size: "2048m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "1800"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "1800"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: voxdocs.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: voxdocs-web
+                port:
+                  number: 80
+  # tls:
+  #   - hosts: [voxdocs.example.com]
+  #     secretName: voxdocs-tls

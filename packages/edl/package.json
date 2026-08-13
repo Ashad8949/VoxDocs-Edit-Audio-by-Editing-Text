@@ -1,0 +1,15 @@
+{
+  "name": "@voxdocs/edl",
+  "version": "1.0.0",
+  "description": "Transcript alignment and edit-decision-list construction for VoxDocs",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": ["src"],
+  "scripts": {
+    "test": "node --test 'test/*.test.js'"
+  },
+  "license": "MIT"
+}

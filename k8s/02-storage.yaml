@@ -1,0 +1,15 @@
+# Media outlives any single API pod, so it lives on a claim rather than in the
+# container. ReadWriteMany lets the API scale past one replica; on a cluster
+# without an RWX class, keep replicas at 1 or move media to object storage.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: voxdocs-media
+  namespace: voxdocs
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 200Gi
+  # storageClassName: standard-rwx   # e.g. GCP Filestore

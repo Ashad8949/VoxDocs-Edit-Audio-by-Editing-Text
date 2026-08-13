@@ -1,0 +1,122 @@
+# The model server.
+#
+# Split from the API server because its resource profile is completely
+# different: it wants CPU and a warm model resident in memory, and it is the
+# component that actually needs a GPU if you give it one. Keeping it separate
+# means transcription load never starves the request path, and each tier scales
+# on its own signal.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voxdocs-model
+  namespace: voxdocs
+  labels:
+    app: voxdocs-model
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: voxdocs-model
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0     # never drop below capacity: model start-up is slow
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: voxdocs-model
+    spec:
+      # Spread replicas so one node failure cannot take out transcription.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: voxdocs-model
+      containers:
+        - name: model
+          image: ghcr.io/voxdocs/model:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: voxdocs-config
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 6Gi
+          # Readiness deliberately hits /ready, which does not force a model
+          # load — otherwise every rollout stalls behind first inference.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          # Transcription is one long request; give it time to drain on SIGTERM.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+      terminationGracePeriodSeconds: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voxdocs-model
+  namespace: voxdocs
+spec:
+  selector:
+    app: voxdocs-model
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voxdocs-model
+  namespace: voxdocs
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voxdocs-model
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Scaling in too eagerly throws away warm models; be slow about it.
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voxdocs-model
+  namespace: voxdocs
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: voxdocs-model

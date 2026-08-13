@@ -1,0 +1,61 @@
+# Local stack. Mirrors the Kubernetes topology: three services, the model
+# server isolated from the API server so they can be sized independently.
+
+services:
+  model:
+    build:
+      context: ./services/model
+      args:
+        WHISPER_MODEL: ${VOXDOCS_WHISPER_MODEL:-base.en}
+    environment:
+      VOXDOCS_WHISPER_MODEL: ${VOXDOCS_WHISPER_MODEL:-base.en}
+      VOXDOCS_ASR_BACKEND: ${VOXDOCS_ASR_BACKEND:-auto}
+      VOXDOCS_PROFILE_TTL: "3600"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      VOXDOCS_MODEL_URL: http://model:8000
+      VOXDOCS_DATA_DIR: /data
+      VOXDOCS_MAX_UPLOAD_MB: "1024"
+    volumes:
+      - media:/data
+    ports:
+      - "3000:3000"
+    depends_on:
+      model:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      VOXDOCS_API_HOST: api
+      VOXDOCS_API_PORT: "3000"
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  media:
