@@ -80,8 +80,45 @@ const json = (body) => ({
 /** Cost/duration preview for an edit, without rendering it. */
 export const planEdit = (id, tokens) => request(`/api/projects/${id}/plan`, json({ tokens }));
 
-export const renderEdit = (id, tokens, { format = 'wav', video = false } = {}) =>
+/**
+ * Queue a render. The backend answers 202 immediately and does the work on a
+ * Celery worker, so this returns the pending render plus where to poll it.
+ */
+export const queueRender = (id, tokens, { format = 'wav', video = false } = {}) =>
   request(`/api/projects/${id}/render`, json({ tokens, format, video }));
+
+export const getRender = (projectId, renderId) =>
+  request(`/api/projects/${projectId}/renders/${renderId}/status`).then((b) => b.render);
+
+/**
+ * Queue a render and wait for the worker to finish it.
+ *
+ * Rendering an hour of audio takes minutes, which is exactly why it is not done
+ * inside the request. Polling keeps the client honest about that instead of
+ * holding a connection open and hoping no proxy times it out.
+ *
+ * @param {(render: any) => void} [onProgress] called on each status change
+ * @param {{ signal?: AbortSignal, intervalMs?: number }} [options]
+ */
+export async function renderEdit(projectId, tokens, options = {}, onProgress) {
+  const { format, video, signal, intervalMs = 1000 } = options;
+  const queued = await queueRender(projectId, tokens, { format, video });
+  let render = queued.render;
+  onProgress?.(render);
+
+  while (render.status === 'pending' || render.status === 'rendering') {
+    if (signal?.aborted) throw new ApiError('Render cancelled.', 0, 'aborted');
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    const next = await getRender(projectId, render.id);
+    if (next.status !== render.status) onProgress?.(next);
+    render = next;
+  }
+
+  if (render.status === 'failed') {
+    throw new ApiError(render.error || 'The render failed.', 500, 'render_failed');
+  }
+  return render;
+}
 
 export const mediaUrl = (id) => `/api/projects/${id}/media`;
 

@@ -1,15 +1,15 @@
 {
   "name": "voxdocs",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Edit audio and video by editing their transcript",
   "type": "module",
-  "workspaces": ["packages/*", "services/api", "web"],
+  "workspaces": ["web"],
   "scripts": {
     "test": "npm run test --workspaces --if-present",
-    "dev:api": "npm run dev --workspace services/api",
     "dev:web": "npm run dev --workspace web",
-    "build:web": "npm run build --workspace web"
+    "build:web": "npm run build --workspace web",
+    "e2e": "node scripts/e2e.mjs"
   },
   "license": "MIT"
 }

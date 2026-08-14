@@ -52,6 +52,23 @@ const json = (body) => ({
   body: JSON.stringify(body),
 });
 
+/**
+ * Queue a render and wait for the worker. The backend answers 202 and does the
+ * work on Celery, so every render here is a queue-then-poll.
+ */
+async function render(projectId, body) {
+  const queued = await api(`/api/projects/${projectId}/render`, json(body));
+  let current = queued.render;
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (current.status === 'pending' || current.status === 'rendering') {
+    if (Date.now() > deadline) throw new Error('timed out waiting for a render');
+    await new Promise((r) => setTimeout(r, 700));
+    ({ render: current } = await api(`/api/projects/${projectId}/renders/${current.id}/status`));
+  }
+  if (current.status !== 'ready') throw new Error(`render failed: ${current.error}`);
+  return current;
+}
+
 const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'voxdocs-e2e-'));
 
 /** Words spoken in the sample, used to build the edits below. */
@@ -122,13 +139,13 @@ try {
     plan.stats.estimatedDuration < plan.stats.sourceDuration,
     `${plan.stats.estimatedDuration.toFixed(2)}s of ${plan.stats.sourceDuration.toFixed(2)}s`);
 
-  const cut = await api(`/api/projects/${id}/render`, json({ tokens: kept, format: 'wav' }));
-  check('render succeeded', Boolean(cut.render.id));
+  const cut = await render(id, { tokens: kept, format: 'wav' });
+  check('render succeeded', Boolean(cut.id));
   check('rendered file is shorter than the source',
-    cut.render.duration < project.duration - 0.3,
-    `${cut.render.duration.toFixed(2)}s vs ${project.duration.toFixed(2)}s`);
+    cut.duration < project.duration - 0.3,
+    `${cut.duration.toFixed(2)}s vs ${project.duration.toFixed(2)}s`);
   check('no synthesis was needed for a pure deletion',
-    cut.render.synthesis.words === 0 && cut.render.warnings.length === 0);
+    cut.synthesis.words === 0 && cut.warnings.length === 0);
 
   const cutPath = path.join(workDir, 'cut.wav');
   await downloadTo(`${API}${cut.downloadUrl}`, cutPath);
@@ -141,11 +158,11 @@ try {
   // ------------------------------------------------------------ insertion
   // The demo's "246 years ago": one word that was never spoken.
   const withInsert = [{ insert: '246' }, ...kept];
-  const inserted = await api(`/api/projects/${id}/render`, json({ tokens: withInsert, format: 'wav' }));
-  check('insertion rendered', Boolean(inserted.render.id));
+  const inserted = await render(id, { tokens: withInsert, format: 'wav' });
+  check('insertion rendered', Boolean(inserted.id));
   check('the inserted word was synthesised, not dropped',
-    inserted.render.synthesis.words === 1 && inserted.render.synthesis.missing.length === 0,
-    JSON.stringify(inserted.render.synthesis));
+    inserted.synthesis.words === 1 && inserted.synthesis.missing.length === 0,
+    JSON.stringify(inserted.synthesis));
 
   const insertPath = path.join(workDir, 'insert.wav');
   await downloadTo(`${API}${inserted.downloadUrl}`, insertPath);
@@ -161,19 +178,19 @@ try {
     ...words.map((w) => ({ ref: w.id })),
     { insert: tail.map((w) => w.text.replace(/[^A-Za-z0-9']/g, '')).join(' ') },
   ];
-  const echo = await api(`/api/projects/${id}/render`, json({ tokens: echoed, format: 'wav' }));
+  const echo = await render(id, { tokens: echoed, format: 'wav' });
   check('repeated words are lifted from the speaker’s own recording',
-    echo.render.synthesis.fromVoiceBank === tail.length,
-    `${echo.render.synthesis.fromVoiceBank}/${echo.render.synthesis.words} from the voice bank`);
-  check('the echo makes the result longer', echo.render.duration > project.duration,
-    `${echo.render.duration.toFixed(2)}s`);
+    echo.synthesis.fromVoiceBank === tail.length,
+    `${echo.synthesis.fromVoiceBank}/${echo.synthesis.words} from the voice bank`);
+  check('the echo makes the result longer', echo.duration > project.duration,
+    `${echo.duration.toFixed(2)}s`);
 
   // ---------------------------------------------------------------- extras
-  const mp3 = await api(`/api/projects/${id}/render`, json({ tokens: kept, format: 'mp3' }));
-  check('mp3 export works', mp3.render.format === 'mp3' && mp3.render.bytes > 0);
+  const mp3 = await render(id, { tokens: kept, format: 'mp3' });
+  check('mp3 export works', mp3.format === 'mp3' && mp3.bytes > 0);
 
-  const empty = await api(`/api/projects/${id}/render`, json({ tokens: [], format: 'wav' }));
-  check('an empty edit renders without error', empty.render.duration < 0.2);
+  const empty = await render(id, { tokens: [], format: 'wav' });
+  check('an empty edit renders without error', empty.duration < 0.2);
 
   await api(`/api/projects/${id}`, { method: 'DELETE' });
   check('project deleted', true);

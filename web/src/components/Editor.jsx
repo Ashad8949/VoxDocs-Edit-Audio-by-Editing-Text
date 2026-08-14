@@ -37,6 +37,7 @@ export default function Editor({ projectId, onBack }) {
 
   const [plan, setPlan] = useState(null);
   const [rendering, setRendering] = useState(false);
+  const [renderStage, setRenderStage] = useState(null);
   const [result, setResult] = useState(null);
   const [format, setFormat] = useState('wav');
 
@@ -233,18 +234,22 @@ export default function Editor({ projectId, onBack }) {
 
   const doRender = async () => {
     setRendering(true);
+    setRenderStage('queued');
     setError(null);
     try {
-      const response = await api.renderEdit(projectId, tokens, {
-        format,
-        video: Boolean(project.hasVideo) && format === 'video',
-      });
-      setResult(response.render);
+      const render = await api.renderEdit(
+        projectId,
+        tokens,
+        { format, video: Boolean(project.hasVideo) && format === 'video' },
+        (update) => setRenderStage(update.status)
+      );
+      setResult(render);
       setProject(await api.getProject(projectId));
     } catch (renderError) {
       setError(renderError.message);
     } finally {
       setRendering(false);
+      setRenderStage(null);
     }
   };
 
@@ -423,7 +428,7 @@ export default function Editor({ projectId, onBack }) {
           {project.hasVideo && <option value="video">MP4 (video)</option>}
         </select>
         <button className="primary" onClick={doRender} disabled={rendering}>
-          {rendering ? 'Rendering…' : 'Export'}
+          {rendering ? renderLabel(renderStage) : 'Export'}
         </button>
       </footer>
 
@@ -457,6 +462,13 @@ export default function Editor({ projectId, onBack }) {
       )}
     </div>
   );
+}
+
+/** What the export button says while a worker is busy. */
+function renderLabel(stage) {
+  if (stage === 'pending') return 'Queued…';
+  if (stage === 'rendering') return 'Rendering…';
+  return 'Working…';
 }
 
 function formatTime(seconds) {

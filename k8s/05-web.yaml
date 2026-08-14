@@ -26,7 +26,7 @@ spec:
               containerPort: 80
           env:
             - name: VOXDOCS_API_HOST
-              value: voxdocs-api
+              value: voxdocs-backend
             - name: VOXDOCS_API_PORT
               value: "3000"
           resources:

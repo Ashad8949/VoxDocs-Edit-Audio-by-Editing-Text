@@ -1,0 +1,62 @@
+# The Celery broker.
+#
+# Deliberately ephemeral: it carries in-flight task messages, not durable state.
+# Losing it loses queued jobs, which the client recovers from by re-requesting a
+# render — far cheaper than running a replicated, persisted queue.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voxdocs-redis
+  namespace: voxdocs
+  labels:
+    app: voxdocs-redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: voxdocs-redis
+  template:
+    metadata:
+      labels:
+        app: voxdocs-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "512mb",
+                 "--maxmemory-policy", "noeviction"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests:
+              cpu: "50m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 640Mi
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voxdocs-redis
+  namespace: voxdocs
+spec:
+  selector:
+    app: voxdocs-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

@@ -4,12 +4,17 @@ metadata:
   name: voxdocs-config
   namespace: voxdocs
 data:
-  # The API server finds the model server through its Service, so model pods can
-  # come and go without the API server knowing.
+  # The backend finds the model server and the broker through Services, so their
+  # pods can come and go without anything else knowing.
   VOXDOCS_MODEL_URL: "http://voxdocs-model:8000"
+  CELERY_BROKER_URL: "redis://voxdocs-redis:6379/0"
   VOXDOCS_DATA_DIR: "/data"
   VOXDOCS_MAX_UPLOAD_MB: "1024"
   VOXDOCS_RENDER_RATE: "48000"
+
+  DJANGO_DEBUG: "0"
+  DJANGO_ALLOWED_HOSTS: "*"
+  DJANGO_LOG_LEVEL: "INFO"
 
   # Model server tuning.
   VOXDOCS_WHISPER_MODEL: "base.en"
@@ -18,6 +23,19 @@ data:
   VOXDOCS_ASR_COMPUTE: "int8"
   VOXDOCS_VOICE_BANK: "1"
   # Voice profiles are a cache, not state: a pod may drop them at any time and
-  # the API server re-seeds on demand.
+  # the backend re-seeds on demand.
   VOXDOCS_PROFILE_CACHE: "64"
   VOXDOCS_PROFILE_TTL: "3600"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: voxdocs-secrets
+  namespace: voxdocs
+type: Opaque
+stringData:
+  # Replace before any real deployment.
+  DJANGO_SECRET_KEY: "change-me-in-production"
+  # Leave empty to use the bundled SQLite; set for Postgres, which is required
+  # once the backend runs more than one replica.
+  DATABASE_URL: ""

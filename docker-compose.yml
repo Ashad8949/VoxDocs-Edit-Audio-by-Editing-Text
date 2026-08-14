@@ -1,7 +1,17 @@
-# Local stack. Mirrors the Kubernetes topology: three services, the model
-# server isolated from the API server so they can be sized independently.
+# Local stack. Mirrors the Kubernetes topology: Django serves the API, a Celery
+# worker does the long jobs, and the model server stays isolated so it can be
+# sized (or GPU-backed) independently.
 
 services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   model:
     build:
       context: ./services/model
@@ -24,19 +34,25 @@ services:
         limits:
           memory: 4g
 
-  api:
+  backend: &backend
     build:
-      context: .
-      dockerfile: services/api/Dockerfile
-    environment:
+      context: ./services/backend
+    environment: &backend_env
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-insecure-key-change-me}
+      DJANGO_DEBUG: "0"
+      DJANGO_ALLOWED_HOSTS: "*"
       VOXDOCS_MODEL_URL: http://model:8000
       VOXDOCS_DATA_DIR: /data
       VOXDOCS_MAX_UPLOAD_MB: "1024"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:-}
     volumes:
       - media:/data
     ports:
       - "3000:3000"
     depends_on:
+      redis:
+        condition: service_healthy
       model:
         condition: service_healthy
     healthcheck:
@@ -45,17 +61,30 @@ services:
       timeout: 3s
       retries: 5
 
+  # Same image and settings as the web tier; only the command differs, so the
+  # two can never drift apart in configuration.
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "voxdocs", "worker", "-l", "info", "--concurrency", "2"]
+    ports: []
+    healthcheck:
+      test: ["CMD", "celery", "-A", "voxdocs", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
   web:
     build:
       context: .
       dockerfile: web/Dockerfile
     environment:
-      VOXDOCS_API_HOST: api
+      VOXDOCS_API_HOST: backend
       VOXDOCS_API_PORT: "3000"
     ports:
       - "8080:80"
     depends_on:
-      - api
+      - backend
 
 volumes:
   media:

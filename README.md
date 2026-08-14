@@ -8,19 +8,25 @@ cleanly is slower. Reading is fast. So the transcript becomes the timeline, and
 every edit to the text is compiled into an edit on the waveform.
 
 ```
-┌──────────┐      ┌────────────────────┐      ┌──────────────────────┐
-│  React   │─/api▶│   Node API server  │─HTTP▶│  Python model server │
-│  editor  │◀─────│  projects, ffmpeg  │◀─────│   ASR + synthesis    │
-└──────────┘      └─────────┬──────────┘      └──────────────────────┘
-                            │
-                      media volume
+                        ┌──────────────────────┐
+┌──────────┐            │  Django + DRF        │        ┌──────────────────┐
+│  React   │──/api─────▶│  projects, ORM,      │──HTTP─▶│  Model server    │
+│  editor  │◀───────────│  transcripts, media  │◀───────│  ASR + synthesis │
+└──────────┘            └──────────┬───────────┘        └──────────────────┘
+                                   │ Redis
+                        ┌──────────▼───────────┐
+                        │  Celery workers      │
+                        │  transcode, render   │
+                        └──────────┬───────────┘
+                                   │
+                             media volume
 ```
 
-The two servers are split because their appetites differ: the model server
-wants a warm model resident in memory and as much CPU (or GPU) as it can get,
-while the API server wants disk and sockets. Separating them lets each scale on
-its own signal, and lets a transcription backlog stop short of starving the
-request path.
+Three tiers, because their appetites differ. The model server wants a warm model
+resident in memory and as much CPU (or GPU) as it can get. The workers want CPU
+for ffmpeg. The web tier wants sockets and does almost no work. Separating them
+lets each scale on its own signal, and stops a transcription backlog from
+starving the request path.
 
 ---
 
@@ -114,24 +120,35 @@ The first build bakes the ASR weights into the model image, so pods start warm.
 
 ### Locally, for development
 
-Prerequisites: **ffmpeg** and **ffprobe** on `PATH`, Node 20+, Python 3.10+.
-`espeak-ng` is optional but enables the fallback synthesiser.
+Prerequisites: **ffmpeg** and **ffprobe** on `PATH`, Python 3.11+, Node 20+, and
+a Redis. `espeak-ng` is optional but enables the fallback synthesiser.
 
 ```bash
+redis-server &                             # the Celery broker
+
 # model server
 cd services/model
 pip install -r requirements.txt
 python -m voxdocs.app                      # :8000
 
-# API server
-npm install
-npm run dev:api                            # :3000
+# Django backend
+cd services/backend
+pip install -r requirements.txt
+python manage.py migrate
+python manage.py runserver 0.0.0.0:3000    # :3000
+
+# Celery worker, in another shell, same directory
+celery -A voxdocs worker -l info
 
 # editor
-npm run dev:web                            # :5173
+npm install && npm run dev:web             # :5173
 ```
 
 Open <http://localhost:5173>.
+
+By default the backend uses SQLite, which is fine for one process. Set
+`DATABASE_URL=postgres://user:pass@host/db` for anything with more than one
+replica.
 
 ### Using it
 
@@ -165,6 +182,7 @@ different claims:
 | Unit selection from the speaker's voice | **Verified** |
 | eSpeak NG fallback, pitch/level matched | **Verified** |
 | ffmpeg render pipeline, audio and video | **Verified** |
+| Django + DRF + Celery/Redis end to end | **Verified** |
 | Silero ASR | Implemented, not run here — needs `torch`; timings are coarser than Whisper's |
 | PaddleSpeech voice cloning | Implemented, not run here — see below |
 
@@ -184,8 +202,9 @@ diarisation before the transcript is built), and no background-music separation
 ## Tests
 
 ```bash
-npm test                                   # EDL, render pipeline, API, editor model
-cd services/model && python -m pytest tests/
+cd services/backend && python -m pytest    # EDL, render pipeline, API, Celery
+cd services/model   && python -m pytest    # ASR, unit selection, DSP
+npm test                                   # the editor's document model
 node scripts/e2e.mjs                       # against a running stack
 ```
 
@@ -212,13 +231,19 @@ ok   repeated words are lifted from the speaker's own recording — 5/5 from the
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/projects` | Upload media; returns `202`, transcription runs in the background |
+| `POST` | `/api/projects` | Upload media; returns `202`, transcription runs on a worker |
 | `GET` | `/api/projects/:id` | Project, status and transcript |
 | `GET` | `/api/projects/:id/envelope?points=N` | Waveform, peak-downsampled |
 | `GET` | `/api/projects/:id/media` | Source media, with range requests |
 | `POST` | `/api/projects/:id/plan` | Cost and duration of an edit, without rendering |
-| `POST` | `/api/projects/:id/render` | Render; returns a download URL |
+| `POST` | `/api/projects/:id/render` | Queue a render; returns `202` |
+| `GET` | `/api/projects/:id/renders/:rid/status` | Poll a queued render |
+| `GET` | `/api/projects/:id/renders/:rid` | Download a finished render |
 | `DELETE` | `/api/projects/:id` | Delete the project and its media |
+
+Both long operations return `202` and are polled, because transcribing or
+re-rendering an hour of audio takes minutes and no browser request should be
+held open for that.
 
 Edits are posted either as `tokens` — `[{ref: "w12"}, {insert: "246"}]`, what the
 editor sends, exact and unambiguous — or as plain `text`, which is aligned
@@ -232,8 +257,12 @@ and scripts use the second.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `VOXDOCS_MODEL_URL` | `http://localhost:8000` | Where the API server finds the model server |
-| `VOXDOCS_DATA_DIR` | `./data` | Project and media storage |
+| `DATABASE_URL` | SQLite | Postgres URL; required for more than one replica |
+| `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Broker for the long jobs |
+| `DJANGO_SECRET_KEY` | dev key | **Must** be set in production |
+| `DJANGO_DEBUG` | `1` | Turn off in production |
+| `VOXDOCS_MODEL_URL` | `http://localhost:8000` | Where the backend finds the model server |
+| `VOXDOCS_DATA_DIR` | `data/media` | Project and media storage |
 | `VOXDOCS_MAX_UPLOAD_MB` | `1024` | Upload ceiling |
 | `VOXDOCS_RENDER_RATE` | `48000` | Canonical render sample rate |
 | `VOXDOCS_SEAM_FADE` | `0.008` | Fade length at each seam, seconds |
@@ -252,21 +281,27 @@ and scripts use the second.
 kubectl apply -f k8s/
 ```
 
-Manifests cover both tiers with their own HPAs and disruption budgets. Two
+Manifests cover all four tiers with their own HPAs and disruption budgets. A few
 choices worth knowing about:
 
-- **Readiness probes hit `/ready`, which does not force a model load.** Probing
-  an endpoint that triggers inference makes every rollout stall behind the first
-  request.
-- **Voice profiles are a cache, never state.** The API server owns the durable
+- **Migrations run as a Job, not on pod start.** Otherwise a multi-replica
+  rollout has several pods racing for the same schema lock.
+- **Web and worker share one image**, differing only in command, so they cannot
+  drift apart in dependencies or configuration.
+- **Readiness probes hit `/api/ready`, which does not force a model load.**
+  Probing an endpoint that triggers inference makes every rollout stall behind
+  the first request.
+- **Voice profiles are a cache, never state.** Django owns the durable
   transcript; the model server only memoises it. So a model pod can be evicted,
   restarted or scaled at any moment, and the worst case is a single re-seed,
-  which the API server performs transparently on a `409`. That is what makes the
-  model tier freely horizontally scalable.
+  which the backend performs transparently on a `409`.
+- **Workers ack late and get a 300 s grace period**, so a render in flight
+  finishes rather than being killed mid-file — and if it is killed anyway, the
+  job is redelivered rather than lost.
 
-Media lives on a `ReadWriteMany` claim so the API tier can run more than one
-replica. On a cluster without an RWX storage class, keep `replicas: 1` or move
-media to object storage.
+Media lives on a `ReadWriteMany` claim, since both the web tier and every worker
+read and write it. On a cluster without an RWX storage class, move media to
+object storage.
 
 ---
 

@@ -1,0 +1,232 @@
+# The Django backend, deployed twice from one image: once as the web tier and
+# once as Celery workers. Sharing the image means the two can never drift apart
+# in dependencies or configuration.
+#
+# Schema migrations run as a Job rather than on pod start, so a multi-replica
+# rollout cannot have several pods racing for the same lock.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: voxdocs-migrate
+  namespace: voxdocs
+  annotations:
+    # Re-apply on every release; the job name must change per release for this
+    # to run again (e.g. templated by Helm/Kustomize with the image tag).
+    helm.sh/hook: pre-install,pre-upgrade
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: ghcr.io/voxdocs/backend:latest
+          command: ["python", "manage.py", "migrate", "--noinput"]
+          envFrom:
+            - configMapRef:
+                name: voxdocs-config
+            - secretRef:
+                name: voxdocs-secrets
+          volumeMounts:
+            - name: media
+              mountPath: /data
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: voxdocs-media
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voxdocs-backend
+  namespace: voxdocs
+  labels:
+    app: voxdocs-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: voxdocs-backend
+  template:
+    metadata:
+      labels:
+        app: voxdocs-backend
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/voxdocs/backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: voxdocs-config
+            - secretRef:
+                name: voxdocs-secrets
+          volumeMounts:
+            - name: media
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "300m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+      # The web tier no longer renders, so it drains quickly.
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: voxdocs-media
+---
+# Workers do the ffmpeg-heavy work, so they get the CPU and the long grace period.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voxdocs-worker
+  namespace: voxdocs
+  labels:
+    app: voxdocs-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: voxdocs-worker
+  template:
+    metadata:
+      labels:
+        app: voxdocs-worker
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/voxdocs/backend:latest
+          imagePullPolicy: IfNotPresent
+          command: ["celery", "-A", "voxdocs", "worker", "-l", "info", "--concurrency", "2"]
+          envFrom:
+            - configMapRef:
+                name: voxdocs-config
+            - secretRef:
+                name: voxdocs-secrets
+          volumeMounts:
+            - name: media
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c",
+                        "celery -A voxdocs inspect ping -d celery@$HOSTNAME --timeout 10"]
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 15
+      # A render in flight should finish rather than be killed mid-file. Celery
+      # acks late, so a job killed anyway is redelivered rather than lost.
+      terminationGracePeriodSeconds: 300
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: voxdocs-media
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voxdocs-backend
+  namespace: voxdocs
+spec:
+  selector:
+    app: voxdocs-backend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voxdocs-backend
+  namespace: voxdocs
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voxdocs-backend
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+---
+# Workers scale on CPU here. Queue depth is the better signal — wire KEDA or a
+# custom metric to `celery.queue.length` if the backlog matters more than load.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voxdocs-worker
+  namespace: voxdocs
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voxdocs-worker
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Never yank a worker mid-render just because load dipped.
+      stabilizationWindowSeconds: 600
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voxdocs-backend
+  namespace: voxdocs
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: voxdocs-backend
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voxdocs-worker
+  namespace: voxdocs
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: voxdocs-worker
