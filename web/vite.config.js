@@ -9,7 +9,10 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: process.env.VOXDOCS_API_URL ?? 'http://localhost:3000',
+        // 127.0.0.1, not localhost: some machines resolve "localhost" to the
+        // IPv6 loopback (::1) first, and Django's dev server only binds the
+        // IPv4 address, so the proxy would connect-fail on every request.
+        target: process.env.VOXDOCS_API_URL ?? 'http://127.0.0.1:3000',
         changeOrigin: true,
       },
     },

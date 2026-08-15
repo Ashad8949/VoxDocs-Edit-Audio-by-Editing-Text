@@ -2,3 +2,15 @@ flask>=3.0,<4
 gunicorn>=21.2
 numpy>=1.24
 faster-whisper>=1.0
+
+# Translation (IndicTrans2 en<->hi)
+torch
+transformers==4.57.6
+sentencepiece
+indic-nlp-library
+sacremoses
+
+# Voice-preserving synthesis (XTTS-v2 cross-lingual cloning)
+coqui-tts
+torchaudio
+torchcodec

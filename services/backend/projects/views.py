@@ -234,6 +234,25 @@ def render_download(request, project_id: str, render_id: str):
     return response
 
 
+def _bounded_reader(handle, length: int):
+    """Iterate a file handle for exactly `length` bytes, then close it.
+
+    FileResponse otherwise reads straight to EOF regardless of Content-Length,
+    which is harmless for a keep-alive-averse client but wastes a full file
+    read server-side on every ranged request.
+    """
+    remaining = length
+    try:
+        while remaining > 0:
+            chunk = handle.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        handle.close()
+
+
 def _serve_file(request, path: Path) -> HttpResponse:
     """Serve a file with range support, which media elements need to seek."""
     size = path.stat().st_size
@@ -241,9 +260,18 @@ def _serve_file(request, path: Path) -> HttpResponse:
 
     range_header = request.headers.get("range", "")
     match = re.match(r"bytes=(\d*)-(\d*)", range_header)
-    if match:
-        start = int(match.group(1)) if match.group(1) else 0
-        end = int(match.group(2)) if match.group(2) else size - 1
+    if match and (match.group(1) or match.group(2)):
+        start_str, end_str = match.group(1), match.group(2)
+        if start_str:
+            start = int(start_str)
+            end = int(end_str) if end_str else size - 1
+        else:
+            # Suffix range ("bytes=-500"): the last N bytes of the file.
+            # Players commonly send this to probe metadata stored at the
+            # tail of a non-faststart video.
+            start = max(0, size - int(end_str))
+            end = size - 1
+
         if start >= size or start > end:
             response = HttpResponse(status=416)
             response["content-range"] = f"bytes */{size}"
@@ -252,7 +280,9 @@ def _serve_file(request, path: Path) -> HttpResponse:
         end = min(end, size - 1)
         handle = open(path, "rb")
         handle.seek(start)
-        response = FileResponse(handle, status=206, content_type=content_type)
+        response = FileResponse(
+            _bounded_reader(handle, end - start + 1), status=206, content_type=content_type
+        )
         response["content-length"] = str(end - start + 1)
         response["content-range"] = f"bytes {start}-{end}/{size}"
         response["accept-ranges"] = "bytes"
@@ -342,3 +372,293 @@ def render_status(request, project_id: str, render_id: str):
     except Render.DoesNotExist as exc:
         raise Http404("render not found") from exc
     return Response({"render": RenderSerializer(render).data})
+
+
+# ----------------------------------------------------------------- translation
+
+
+@api_view(["POST"])
+def project_translate(request, project_id: str):
+    """Create a new translation for a project.
+    
+    Request body: {targetLanguage: "hi" | "hinglish" | "en"}
+    Response: {translation: {id, status, targetLanguage, ...}}
+    """
+    from .models import Translation
+    from .services import translation as translation_svc
+    from .tasks import translate_project
+
+    project = get_project(project_id)
+    require_ready(project)
+
+    target_language = request.data.get("targetLanguage") or request.data.get("target_language")
+    if not target_language:
+        return Response(
+            {"error": "validation_error", "message": "targetLanguage is required"},
+            status=400,
+        )
+
+    try:
+        translation = translation_svc.create_translation(project, target_language)
+    except ValueError as exc:
+        return Response(
+            {"error": "validation_error", "message": str(exc)},
+            status=400,
+        )
+
+    # Queue translation task
+    translate_project.delay(translation.id)
+
+    return Response(
+        {
+            "translation": {
+                "id": translation.id,
+                "status": translation.status,
+                "targetLanguage": translation.target_language,
+                "sourceLanguage": translation.source_language,
+            }
+        },
+        status=202,
+    )
+
+
+@api_view(["GET"])
+def translations_list(request, project_id: str):
+    """List all translations for a project."""
+    from .models import Translation
+
+    project = get_project(project_id)
+    translations = project.translations.all().order_by("-created_at")
+
+    return Response(
+        {
+            "translations": [
+                {
+                    "id": t.id,
+                    "status": t.status,
+                    "targetLanguage": t.target_language,
+                    "sourceLanguage": t.source_language,
+                    "error": t.error,
+                    "createdAt": t.created_at.isoformat(),
+                }
+                for t in translations
+            ]
+        }
+    )
+
+
+@api_view(["GET"])
+def translation_detail(request, project_id: str, translation_id: str):
+    """Get details of a translation including translated transcript."""
+    from .models import Translation
+
+    project = get_project(project_id)
+    try:
+        translation = project.translations.get(pk=translation_id)
+    except Exception as exc:
+        raise Http404("translation not found") from exc
+
+    # Reconstruct full transcript with both original and translated
+    segments = list(project.segments.order_by("index").values(
+        "index", "start", "end", "text", "first_word", "last_word"
+    ))
+    translated_text = translation.translated_text or {}
+
+    response_segments = []
+    for seg in segments:
+        idx = seg["index"]
+        response_segments.append({
+            "index": idx,
+            "start": seg["start"],
+            "end": seg["end"],
+            "originalText": seg["text"],
+            "translatedText": translated_text.get(str(idx), seg["text"]),
+            "firstWord": seg["first_word"],
+            "lastWord": seg["last_word"],
+        })
+
+    return Response(
+        {
+            "translation": {
+                "id": translation.id,
+                "status": translation.status,
+                "targetLanguage": translation.target_language,
+                "sourceLanguage": translation.source_language,
+                "error": translation.error,
+                "segments": response_segments,
+                "edits": translation.edits,
+            }
+        }
+    )
+
+
+@api_view(["PUT"])
+def translation_edit(request, project_id: str, translation_id: str):
+    """Apply edits to a translation.
+    
+    Request body: {
+        edits: [
+            {type: "segment", index: 0, text: "new text", keepOriginal: false},
+            ...
+        ]
+    }
+    """
+    from .models import Translation
+    from .services import translation as translation_svc
+
+    project = get_project(project_id)
+    try:
+        translation = project.translations.get(pk=translation_id)
+    except Exception as exc:
+        raise Http404("translation not found") from exc
+
+    if translation.status == Translation.Status.FAILED:
+        return Response(
+            {"error": "translation_failed", "message": translation.error},
+            status=400,
+        )
+
+    edits = request.data.get("edits", [])
+    result = translation_svc.apply_translation_edits(translation, edits)
+
+    return Response(
+        {
+            "translation": {
+                "id": translation.id,
+                "translatedText": result["translated_text"],
+                "edits": result["edits"],
+            }
+        }
+    )
+
+
+# ----------------------------------------------------------------- dub render
+
+
+@api_view(["POST"])
+def translation_dub_render(request, project_id: str, translation_id: str):
+    """Queue a dubbed render (translated audio + original video).
+    
+    Request body: {format: "mp4" | "webm" | "mkv"}
+    Response: {dubRender: {id, status, ...}}
+    """
+    from .models import DubRender, Translation
+    from .tasks import render_dub
+
+    project = get_project(project_id)
+    try:
+        translation = project.translations.get(pk=translation_id)
+    except Exception as exc:
+        raise Http404("translation not found") from exc
+
+    if not project.has_video:
+        return Response(
+            {"error": "no_video", "message": "Project has no video to dub"},
+            status=400,
+        )
+
+    if translation.status != Translation.Status.READY:
+        return Response(
+            {"error": "translation_not_ready", "message": f"Translation status is {translation.status}"},
+            status=400,
+        )
+
+    output_format = request.data.get("format", "mp4")
+    if output_format not in {"mp4", "webm", "mkv", "mov"}:
+        return Response(
+            {"error": "unsupported_format", "message": f"Format {output_format} not supported"},
+            status=400,
+        )
+
+    dub_render = DubRender.objects.create(
+        translation=translation,
+        format=output_format,
+        status=DubRender.Status.PENDING,
+    )
+
+    # Queue render task
+    render_dub.delay(dub_render.id)
+
+    return Response(
+        {
+            "dubRender": {
+                "id": dub_render.id,
+                "status": dub_render.status,
+                "format": dub_render.format,
+                "createdAt": dub_render.created_at.isoformat(),
+            }
+        },
+        status=202,
+    )
+
+
+@api_view(["GET"])
+def dub_render_status(request, project_id: str, translation_id: str, dub_render_id: str):
+    """Poll a queued dub render."""
+    from .models import DubRender, Translation
+
+    project = get_project(project_id)
+    try:
+        translation = project.translations.get(pk=translation_id)
+    except Exception:
+        raise Http404("translation not found")
+
+    try:
+        dub_render = translation.dub_renders.get(pk=dub_render_id)
+    except DubRender.DoesNotExist as exc:
+        raise Http404("dub render not found") from exc
+
+    download_url = None
+    if dub_render.status == DubRender.Status.READY and dub_render.file:
+        download_url = f"/api/projects/{project_id}/translations/{translation_id}/dubs/{dub_render_id}"
+
+    return Response(
+        {
+            "dubRender": {
+                "id": dub_render.id,
+                "status": dub_render.status,
+                "format": dub_render.format,
+                "error": dub_render.error,
+                "duration": dub_render.duration,
+                "bytes": dub_render.bytes,
+                "downloadUrl": download_url,
+                "stats": dub_render.stats,
+                "warnings": dub_render.warnings,
+                "synthesis": dub_render.synthesis,
+                "createdAt": dub_render.created_at.isoformat(),
+            }
+        }
+    )
+
+
+@api_view(["GET"])
+def dub_render_download(request, project_id: str, translation_id: str, dub_render_id: str):
+    """Download a dubbed render."""
+    from .models import DubRender, Translation
+
+    project = get_project(project_id)
+    try:
+        translation = project.translations.get(pk=translation_id)
+    except Exception:
+        raise Http404("translation not found")
+
+    try:
+        dub_render = translation.dub_renders.get(pk=dub_render_id)
+    except DubRender.DoesNotExist as exc:
+        raise Http404("dub render not found") from exc
+
+    if dub_render.status != DubRender.Status.READY or not dub_render.path:
+        return Response(
+            {"error": "not_ready", "message": f"Dub render status is {dub_render.status}"},
+            status=404,
+        )
+
+    if not dub_render.path.exists():
+        log.error("render file missing for %s", dub_render_id)
+        return Response(
+            {"error": "file_missing", "message": "Render file not found on server"},
+            status=500,
+        )
+
+    return _serve_file(request, dub_render.path)
+

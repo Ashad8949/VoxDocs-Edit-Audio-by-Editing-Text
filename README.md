@@ -120,8 +120,10 @@ The first build bakes the ASR weights into the model image, so pods start warm.
 
 ### Locally, for development
 
-Prerequisites: **ffmpeg** and **ffprobe** on `PATH`, Python 3.11+, Node 20+, and
-a Redis. `espeak-ng` is optional but enables the fallback synthesiser.
+Prerequisites: **ffmpeg** and **ffprobe** on `PATH`, Python 3.11+, and a Redis.
+`espeak-ng` is optional but enables the fallback synthesiser. The backend is
+Django-first; the React editor is optional if you only want to verify the
+server-side pipeline.
 
 ```bash
 redis-server &                             # the Celery broker
@@ -139,12 +141,10 @@ python manage.py runserver 0.0.0.0:3000    # :3000
 
 # Celery worker, in another shell, same directory
 celery -A voxdocs worker -l info
-
-# editor
-npm install && npm run dev:web             # :5173
 ```
 
-Open <http://localhost:5173>.
+Open <http://localhost:3000> for the API and Django app, or run the editor
+separately only if you want the React UI.
 
 By default the backend uses SQLite, which is fine for one process. Set
 `DATABASE_URL=postgres://user:pass@host/db` for anything with more than one
@@ -202,10 +202,9 @@ diarisation before the transcript is built), and no background-music separation
 ## Tests
 
 ```bash
-cd services/backend && python -m pytest    # EDL, render pipeline, API, Celery
-cd services/model   && python -m pytest    # ASR, unit selection, DSP
-npm test                                   # the editor's document model
-node scripts/e2e.mjs                       # against a running stack
+cd services/backend && python -m pytest                       # EDL, render pipeline, API, Celery
+cd services/model   && python -m pytest                       # ASR, unit selection, DSP
+cd services/backend && python manage.py verify_pipeline       # live stack verification, Django-only
 ```
 
 The unit suites cover the parts that are easy to get subtly wrong: the diff and
@@ -214,10 +213,10 @@ actual samples — they build a master of distinct tones and check by frequency
 that the right slices survived, and measure the waveform across a seam to prove
 it is continuous.
 
-`scripts/e2e.mjs` goes further and asserts on meaning: it edits a real recording
-through the real API, then **transcribes the rendered output** to confirm the
-deleted words are gone and the inserted ones are audible. A pipeline can pass
-every unit test and still emit silence.
+`python manage.py verify_pipeline` is the end-to-end Django verification step: it
+hits the running HTTP API, renders an edit, and transcribes the output to confirm
+the deleted words are gone and the inserted ones are audible. This is the backend
+verification path; it does not require Node or the React editor.
 
 ```
 ok   the cut words are gone from the audio — years ago, our farmers brought forth…

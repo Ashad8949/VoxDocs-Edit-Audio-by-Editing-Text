@@ -33,9 +33,12 @@ def run_ffmpeg(args: list[str], filter_script: str | None = None,
                timeout: float | None = None) -> str:
     """Run ffmpeg.
 
-    A ``filter_script`` is written to a file and passed with
-    ``-filter_complex_script`` rather than on the command line: a heavily edited
-    transcript produces a filter graph far longer than the OS argument limit.
+    A ``filter_script`` is written to a file and passed with ``-/filter_complex``
+    (the file-reference form of ``-filter_complex``) rather than on the command
+    line: a heavily edited transcript produces a filter graph far longer than
+    the OS argument limit. Older ffmpeg builds spell this ``-filter_complex_script``;
+    that flag was dropped from the CLI at some point, ``-/filter_complex`` is
+    the current form.
     """
     script_path = None
     try:
@@ -48,7 +51,7 @@ def run_ffmpeg(args: list[str], filter_script: str | None = None,
             handle.close()
             script_path = handle.name
             # Filter options must precede the output file, which callers put last.
-            final_args = [*args[:-1], "-filter_complex_script", script_path, args[-1]]
+            final_args = [*args[:-1], "-/filter_complex", script_path, args[-1]]
 
         completed = subprocess.run(
             [_config("FFMPEG"), "-nostdin", "-v", "error", *final_args],
@@ -147,3 +150,40 @@ def make_preview_audio(source: str | Path, output: str | Path) -> Path:
         str(output),
     ])
     return Path(output)
+
+
+def mux_audio_to_video(
+    video_source: str | Path,
+    audio_source: str | Path,
+    output: str | Path,
+    output_format: str = "mp4",
+) -> Path:
+    """Mux a new audio track into a video file.
+    
+    Keeps the original video codec/quality; replaces audio track.
+    """
+    output_path = Path(output)
+    
+    # Determine codec based on format
+    codec_map = {
+        "mp4": "aac",
+        "webm": "libopus",
+        "mkv": "aac",
+        "mov": "aac",
+    }
+    audio_codec = codec_map.get(output_format, "aac")
+    
+    run_ffmpeg([
+        "-y",
+        "-i", str(video_source),
+        "-i", str(audio_source),
+        "-c:v", "copy",  # Copy video codec as-is
+        "-c:a", audio_codec,  # Re-encode audio to target codec
+        "-map", "0:v:0",  # Video from first input
+        "-map", "1:a:0",  # Audio from second input
+        "-shortest",  # Trim to shortest stream
+        str(output_path),
+    ])
+    
+    return output_path
+

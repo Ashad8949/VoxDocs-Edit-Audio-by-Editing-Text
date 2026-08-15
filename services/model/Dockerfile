@@ -17,7 +17,7 @@ COPY voxdocs ./voxdocs
 
 # Bake the ASR weights into the image. Without this the first request after
 # every pod start pays a model download, which makes autoscaling useless.
-ARG WHISPER_MODEL=base.en
+ARG WHISPER_MODEL=small
 ENV VOXDOCS_WHISPER_MODEL=${WHISPER_MODEL}
 ENV HF_HOME=/app/.cache
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='int8')"

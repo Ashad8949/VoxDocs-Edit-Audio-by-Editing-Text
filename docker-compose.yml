@@ -16,11 +16,17 @@ services:
     build:
       context: ./services/model
       args:
-        WHISPER_MODEL: ${VOXDOCS_WHISPER_MODEL:-base.en}
+        WHISPER_MODEL: ${VOXDOCS_WHISPER_MODEL:-small}
     environment:
-      VOXDOCS_WHISPER_MODEL: ${VOXDOCS_WHISPER_MODEL:-base.en}
+      VOXDOCS_WHISPER_MODEL: ${VOXDOCS_WHISPER_MODEL:-small}
       VOXDOCS_ASR_BACKEND: ${VOXDOCS_ASR_BACKEND:-auto}
       VOXDOCS_PROFILE_TTL: "3600"
+      HF_TOKEN: ${HF_TOKEN:-}
+      # XTTS-v2 ships under Coqui's CPML license (free for research/personal
+      # use, commercial license required to monetize). Unset by default so
+      # voice cloning silently falls back to generic synthesis until you
+      # deliberately opt in by setting this to 1 in your own .env.
+      COQUI_TOS_AGREED: ${COQUI_TOS_AGREED:-0}
     ports:
       - "8000:8000"
     healthcheck:

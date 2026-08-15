@@ -101,7 +101,7 @@ class FasterWhisperBackend:
 
     def __init__(self, model_size: str | None = None, device: str | None = None,
                  compute_type: str | None = None) -> None:
-        self.model_size = model_size or os.environ.get("VOXDOCS_WHISPER_MODEL", "base.en")
+        self.model_size = model_size or os.environ.get("VOXDOCS_WHISPER_MODEL", "small")
         self.device = device or os.environ.get("VOXDOCS_ASR_DEVICE", "cpu")
         self.compute_type = compute_type or os.environ.get(
             "VOXDOCS_ASR_COMPUTE", "int8" if self.device == "cpu" else "float16"

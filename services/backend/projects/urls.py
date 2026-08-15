@@ -26,4 +26,22 @@ urlpatterns = [
         "projects/<str:project_id>/renders/<str:render_id>/status",
         views.render_status, name="render-status",
     ),
+
+    # Translation endpoints
+    path("projects/<str:project_id>/translate", views.project_translate, name="project-translate"),
+    path("projects/<str:project_id>/translations", views.translations_list, name="translations-list"),
+    path("projects/<str:project_id>/translations/<str:translation_id>", views.translation_detail, name="translation-detail"),
+    path("projects/<str:project_id>/translations/<str:translation_id>/edit", views.translation_edit, name="translation-edit"),
+
+    # Dub render endpoints
+    path("projects/<str:project_id>/translations/<str:translation_id>/dub", views.translation_dub_render, name="translation-dub-render"),
+    path(
+        "projects/<str:project_id>/translations/<str:translation_id>/dubs/<str:dub_render_id>",
+        views.dub_render_download, name="dub-render-download",
+    ),
+    path(
+        "projects/<str:project_id>/translations/<str:translation_id>/dubs/<str:dub_render_id>/status",
+        views.dub_render_status, name="dub-render-status",
+    ),
 ]
+

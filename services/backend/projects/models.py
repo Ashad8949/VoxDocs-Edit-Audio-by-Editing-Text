@@ -195,3 +195,123 @@ class Render(models.Model):
 
     def __str__(self) -> str:
         return f"{self.id} ({self.status})"
+
+
+class Translation(models.Model):
+    """A translated version of a project's transcript."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        TRANSLATING = "translating", "Translating"
+        READY = "ready", "Ready"
+        FAILED = "failed", "Failed"
+
+    id = models.CharField(primary_key=True, max_length=64, default=new_id, editable=False)
+    project = models.ForeignKey(Project, related_name="translations", on_delete=models.CASCADE)
+    
+    # Original language auto-filled from project; target is user-selected
+    source_language = models.CharField(max_length=16, default="en")
+    target_language = models.CharField(max_length=16)  # e.g., "hi", "hinglish", "en"
+    
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    error = models.TextField(blank=True, default="")
+
+    # Translated text at segment level; individual words inherit timings from source
+    translated_text = models.JSONField(default=dict)  # {segment_index: "translated text"}
+    
+    # User edits: can override per-segment or per-word
+    # Format: list of {type: "segment" | "word", index: int, text: str, keepOriginal: bool}
+    edits = models.JSONField(default=list)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "target_language"],
+                name="unique_project_target_language",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.project.id} → {self.target_language} ({self.status})"
+
+    @property
+    def directory(self) -> Path:
+        return self.project.directory / "translations" / self.id
+
+
+class DubRender(models.Model):
+    """A dubbed video output combining original visuals with translated/edited audio."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RENDERING = "rendering", "Rendering"
+        READY = "ready", "Ready"
+        FAILED = "failed", "Failed"
+
+    id = models.CharField(primary_key=True, max_length=64, default=new_id, editable=False)
+    translation = models.ForeignKey(Translation, related_name="dub_renders", on_delete=models.CASCADE)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    error = models.TextField(blank=True, default="")
+
+    # Output format: mp4, webm, etc.
+    format = models.CharField(max_length=8, default="mp4")
+    
+    # Final dubbed video file
+    file = models.CharField(max_length=255, blank=True, default="")
+    bytes = models.BigIntegerField(default=0)
+    duration = models.FloatField(default=0.0)
+
+    # Render stats and synthesis info
+    stats = models.JSONField(default=dict)
+    warnings = models.JSONField(default=list)
+    synthesis = models.JSONField(default=dict)
+
+    task_id = models.CharField(max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["translation", "-created_at"])]
+
+    @property
+    def directory(self) -> Path:
+        return self.translation.directory / "renders" / self.id
+
+    @property
+    def path(self) -> Path | None:
+        return self.directory / self.file if self.file else None
+
+    def __str__(self) -> str:
+        return f"{self.id} ({self.status})"
+
+
+class VoiceProfile(models.Model):
+    """Speaker voice embedding and metadata for voice-preserving synthesis."""
+
+    project = models.OneToOneField(Project, related_name="voice_profile", on_delete=models.CASCADE)
+
+    # Voice embedding or speaker ID from the model server
+    # This could be a vector, a speaker model ID, or a reference to a voice bank entry
+    embedding = models.JSONField(default=dict)  # {model: "whisper", embedding: [...], speaker_id: "..."}
+    
+    # Voice characteristics extracted from original audio
+    pitch_info = models.JSONField(default=dict)  # {mean_pitch_hz, std_dev, range_hz, ...}
+    spectral_features = models.JSONField(default=dict)  # {mfcc, formants, ...}
+    
+    # Which languages this voice is confident to synthesize
+    supported_languages = models.JSONField(default=list)  # ["en", "hi", "hinglish"]
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "Voice profiles"
+
+    def __str__(self) -> str:
+        return f"VoiceProfile({self.project.id})"

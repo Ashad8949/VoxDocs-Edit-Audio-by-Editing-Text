@@ -200,6 +200,29 @@ kbd {
 
 .transport { display: flex; align-items: center; gap: 12px; }
 
+.preview-source {
+  display: flex;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 3px;
+  width: fit-content;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.preview-source button {
+  background: none;
+  border: none;
+  padding: 5px 14px;
+  border-radius: calc(var(--radius) - 3px);
+  color: var(--muted);
+}
+.preview-source button:hover:not(:disabled) { background: var(--panel-2); }
+.preview-source button.active {
+  background: var(--accent-strong);
+  color: #0b1220;
+}
+
 .play {
   width: 42px; height: 42px; flex: none;
   border-radius: 50%;

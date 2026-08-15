@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from django.core.management import call_command
 from django.urls import reverse
 
 from projects.models import Project, Render, Word
@@ -94,6 +95,56 @@ def project(client, tone_file, stub_model, settings, tmp_path):
     assert response.status_code == 202
     return Project.objects.get(pk=response.json()["project"]["id"])
 
+
+def test_verify_pipeline_command_runs_with_mocked_api(monkeypatch, tmp_path):
+    sample = tmp_path / "sample.wav"
+    sample.write_bytes(b"not-a-real-audio-file")
+
+    class FakeResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    def fake_request(method, url, **kwargs):
+        data = kwargs.get("json") or {}
+        files = kwargs.get("files") or {}
+
+        if url.endswith("/api/health"):
+            return FakeResponse({"status": "ok", "modelError": None})
+        if url.endswith("/api/projects") and method == "POST":
+            return FakeResponse({"project": {"id": "proj-123", "status": "ready"}}, status_code=202)
+        if url.endswith("/api/projects/proj-123") and method == "GET":
+            return FakeResponse({"project": {"status": "ready", "duration": 9.0, "transcript": {"words": [
+                {"id": "w0", "text": "four", "start": 0.1, "end": 0.3},
+                {"id": "w1", "text": "score", "start": 0.4, "end": 0.7},
+                {"id": "w2", "text": "and", "start": 0.8, "end": 1.1},
+                {"id": "w3", "text": "seven", "start": 1.2, "end": 1.6},
+                {"id": "w4", "text": "years", "start": 1.7, "end": 2.1},
+                {"id": "w5", "text": "ago", "start": 2.2, "end": 2.5},
+                {"id": "w6", "text": "our", "start": 2.6, "end": 2.9},
+                {"id": "w7", "text": "fathers", "start": 3.0, "end": 3.4},
+            ]}}})
+        if url.endswith("/api/projects/proj-123/plan") and method == "POST":
+            return FakeResponse({"stats": {"deletedWords": 1, "estimatedDuration": 1.0, "sourceDuration": 3.0}})
+        if url.endswith("/api/projects/proj-123/render") and method == "POST":
+            return FakeResponse({"render": {"id": "rend-1", "status": "ready", "format": "wav", "duration": 2.0, "downloadUrl": "/api/projects/proj-123/renders/rend-1", "synthesis": {"words": 0, "missing": [], "fromVoiceBank": 0, "coverage": 1}, "warnings": []}}, status_code=202)
+        if url.endswith("/api/projects/proj-123/renders/rend-1") and method == "GET":
+            return FakeResponse({"render": {"status": "ready", "id": "rend-1", "format": "wav", "duration": 2.0, "downloadUrl": "/api/projects/proj-123/renders/rend-1", "synthesis": {"words": 0, "missing": [], "fromVoiceBank": 0, "coverage": 1}, "warnings": []}})
+        if url.endswith("/api/projects/proj-123") and method == "DELETE":
+            return FakeResponse({"deleted": True})
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+    monkeypatch.setattr("projects.management.commands.verify_pipeline.requests.request", fake_request)
+    monkeypatch.setattr("projects.management.commands.verify_pipeline.subprocess.run", lambda *args, **kwargs: None)
+
+    call_command("verify_pipeline", api="http://localhost:3000", file=str(sample), stdout=None)
 
 # ------------------------------------------------------------------ health
 

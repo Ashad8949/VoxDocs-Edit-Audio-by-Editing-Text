@@ -1,6 +1,6 @@
 """Speech synthesis for inserted text.
 
-Three strategies, tried in order, because they trade off very differently:
+Four strategies, tried in order, because they trade off very differently:
 
 1. **Unit selection from the speaker's own recording.** If the words the user
    typed were already said somewhere in the file, the best possible synthesis
@@ -9,12 +9,17 @@ Three strategies, tried in order, because they trade off very differently:
    because it *is* the surrounding audio. Longest-match n-gram selection keeps
    naturally coarticulated runs intact.
 
-2. **Neural voice cloning.** For words that were never said, a cloned voice is
-   the only way to get them. The PaddleSpeech stack from the original VoxDocs
-   prototype is wired up here: GE2E speaker embedding conditioning a FastSpeech2
-   acoustic model, vocoded by Parallel WaveGAN.
+2. **Neural voice cloning (XTTS-v2).** For words that were never said, cloning
+   the speaker's voice from a clip of their own audio is the best available
+   synthesis — natural prosody, and it actually sounds like them, unlike the
+   formant fallback below. The same model voice_clone.py uses for dubbing.
 
-3. **Formant-matched fallback.** When no neural model is installed, eSpeak NG
+3. **Neural voice cloning (PaddleSpeech).** The stack from the original
+   VoxDocs prototype: GE2E speaker embedding conditioning a FastSpeech2
+   acoustic model, vocoded by Parallel WaveGAN. Disabled unless
+   VOXDOCS_ENABLE_PADDLE is set; XTTS supersedes it when both are available.
+
+4. **Formant-matched fallback.** When no neural model is installed, eSpeak NG
    synthesises the words and the result is pitch- and level-matched to the
    speaker. It does not sound like them, and it is not meant to: it makes the
    edit audible and reviewable rather than silently dropping words.
@@ -39,6 +44,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import audio as audio_util
+from .voice_clone import XttsVoiceCloner, trim_reference
 
 log = logging.getLogger(__name__)
 
@@ -361,6 +367,37 @@ class PaddleSpeechBackend(TtsBackend):
         return samples, profile.sample_rate
 
 
+class XttsBackend(TtsBackend):
+    """Cross-lingual neural voice cloning via Coqui XTTS-v2.
+
+    Conditions directly on a clip of the project's own source audio, so
+    inserted words come out sounding like the actual speaker rather than a
+    pitch-matched formant voice — the same model voice_clone.py uses for
+    dubbing, reused here for same-language insertions too. Tried before
+    PaddleSpeech/eSpeak since it is the highest-quality option available.
+    """
+
+    name = "xtts"
+
+    def __init__(self) -> None:
+        self._cloner = XttsVoiceCloner()
+
+    def available(self) -> bool:
+        return self._cloner.available()
+
+    def synthesize(self, text: str, profile: VoiceProfile) -> tuple[np.ndarray, int]:
+        if profile.samples is None:
+            raise RuntimeError("voice cloning needs the source audio; none was cached")
+
+        reference = trim_reference(profile.samples, profile.sample_rate)
+        with tempfile.TemporaryDirectory() as tmp:
+            ref_path = os.path.join(tmp, "reference.wav")
+            with open(ref_path, "wb") as fh:
+                fh.write(audio_util.encode_wav(reference, profile.sample_rate))
+            samples = self._cloner.synthesize(text, "en", ref_path)
+        return samples, self._cloner.sample_rate
+
+
 class EspeakBackend(TtsBackend):
     """Formant synthesis, pitch- and level-matched to the speaker.
 
@@ -417,6 +454,7 @@ class Synthesizer:
                  tts_backends: list[TtsBackend] | None = None) -> None:
         self.enable_voice_bank = enable_voice_bank
         self.tts_backends = tts_backends if tts_backends is not None else [
+            XttsBackend(),
             PaddleSpeechBackend(),
             EspeakBackend(),
         ]
@@ -464,45 +502,37 @@ class Synthesizer:
         else:
             resolved, covered = list(phrase), []
 
-        # Consecutive unresolved words are synthesised as one phrase so the TTS
-        # model can apply sentence-level prosody instead of word-by-word staccato.
+        fully_covered = bool(covered) and not any(isinstance(item, str) for item in resolved)
+
         units: list[Unit] = []
         backends: list[str] = []
         generated: list[str] = []
         missing: list[str] = []
         gap = profile.median_gap if profile.median_gap > 0 else 0.08
 
-        if covered:
+        if fully_covered:
+            # Every word already exists in the speaker's own recording: splice
+            # those clips directly. Real audio always beats even a good clone.
             backends.append("voice-bank")
-
-        pending: list[str] = []
-
-        def flush_pending() -> None:
-            nonlocal pending
-            if not pending:
-                return
-            joined = " ".join(pending)
-            unit, backend = self._tts(joined, profile)
-            if unit is not None:
+            for item in resolved:
                 if units:
                     units.append(Unit(type="silence", duration=gap, origin="spacing"))
+                units.append(item)
+        else:
+            # Splicing a handful of voice-bank words into a mostly-synthesised
+            # phrase sounds worse than it should: each spliced word carries the
+            # pitch and pacing of a *different* sentence, so the result stutters
+            # — stops and starts — exactly where the source changes. A neural
+            # voice carrying the *whole* phrase in one continuous pass keeps
+            # prosody smooth; that only costs something when nothing needs
+            # synthesis at all, which is the branch above.
+            unit, backend = self._tts(text, profile)
+            if unit is not None:
                 units.append(unit)
-                generated.extend(pending)
-                if backend not in backends:
-                    backends.append(backend)
+                generated = list(phrase)
+                backends.append(backend)
             else:
-                missing.extend(pending)
-            pending = []
-
-        for item in resolved:
-            if isinstance(item, str):
-                pending.append(item)
-                continue
-            flush_pending()
-            if units:
-                units.append(Unit(type="silence", duration=gap, origin="spacing"))
-            units.append(item)
-        flush_pending()
+                missing = list(phrase)
 
         if units:
             if lead_gap > 0:
@@ -513,7 +543,7 @@ class Synthesizer:
         return SynthesisResult(
             units=units,
             backends=backends,
-            covered=covered,
+            covered=covered if fully_covered else [],
             generated=generated,
             missing=missing,
         )

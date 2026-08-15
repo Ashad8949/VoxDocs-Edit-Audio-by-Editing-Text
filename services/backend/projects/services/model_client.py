@@ -121,3 +121,71 @@ def synthesize_batch(project_id: str, items: list[dict], reseed) -> dict:
     if not response.ok:
         raise _raise_for(response)
     return response.json()
+
+
+def translate_segments(project_id: str, segments: list[str], source_language: str,
+                       target_language: str) -> dict:
+    """Translate a list of text segments to target language.
+    
+    Returns:
+    - translations: list of translated texts
+    - confidence: overall confidence score
+    - metadata: language pair info
+    """
+    payload = {
+        "project_id": project_id,
+        "segments": segments,
+        "source_language": source_language,
+        "target_language": target_language,
+    }
+    response = _request("POST", "/translate", json=payload)
+    if not response.ok:
+        raise _raise_for(response)
+    return response.json()
+
+
+def extract_voice_profile(project_id: str, audio_path: Path) -> dict:
+    """Extract voice profile/embedding from audio for voice-preserving synthesis.
+    
+    Returns:
+    - embedding: vector or speaker ID from model server
+    - pitch_info: {mean_pitch_hz, std_dev, range_hz}
+    - spectral_features: {mfcc, formants, energy}
+    - supported_languages: list of languages this voice can synthesize
+    """
+    data = {"project_id": project_id}
+    with open(audio_path, "rb") as handle:
+        response = _request(
+            "POST", "/voice-profile/extract",
+            files={"audio": (Path(audio_path).name, handle)},
+            data=data,
+        )
+    if not response.ok:
+        raise _raise_for(response)
+    return response.json()
+
+
+def synthesize_with_voice(project_id: str, text: str, target_language: str,
+                          context_before: str = "", context_after: str = "") -> dict:
+    """Synthesize text using the project's extracted voice profile.
+    
+    This differs from batch synthesis in that it specifically targets
+    the speaker's voice for multilingual synthesis.
+    
+    Returns:
+    - type: "audio" or "source" (reuse of original)
+    - data: base64 encoded WAV if type=="audio"
+    - start/end: timing if type=="source" (reuse of original)
+    - word: the synthesized word/phrase
+    """
+    payload = {
+        "project_id": project_id,
+        "text": text,
+        "target_language": target_language,
+        "context_before": context_before,
+        "context_after": context_after,
+    }
+    response = _request("POST", "/synthesize/voice", json=payload)
+    if not response.ok:
+        raise _raise_for(response)
+    return response.json()

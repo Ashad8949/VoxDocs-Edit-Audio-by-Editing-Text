@@ -13,6 +13,7 @@ import {
   updateInsert,
   wordIndexAtTime,
 } from '../lib/doc.js';
+import DubStudio from './DubStudio.jsx';
 import Transcript from './Transcript.jsx';
 import Waveform from './Waveform.jsx';
 
@@ -22,6 +23,7 @@ export default function Editor({ projectId, onBack }) {
   const [project, setProject] = useState(null);
   const [envelope, setEnvelope] = useState(null);
   const [error, setError] = useState(null);
+  const [view, setView] = useState('edit'); // 'edit' | 'dub'
 
   const [doc, setDoc] = useState([]);
   const [past, setPast] = useState([]);
@@ -41,7 +43,14 @@ export default function Editor({ projectId, onBack }) {
   const [result, setResult] = useState(null);
   const [format, setFormat] = useState('wav');
 
+  // Renders completed this session, so the preview can play the edited
+  // result directly instead of only offering it as a download; 'original'
+  // means the source media, otherwise it's a render id.
+  const [renders, setRenders] = useState([]);
+  const [previewSource, setPreviewSource] = useState('original');
+
   const mediaRef = useRef(null);
+  const editedAudioRef = useRef(null);
   const surfaceRef = useRef(null);
 
   // ------------------------------------------------------------ loading
@@ -196,17 +205,43 @@ export default function Editor({ projectId, onBack }) {
 
   // ----------------------------------------------------------- playback
 
+  // When previewing an edited render that wasn't exported as a video (no
+  // re-muxed picture to go with it), the original video keeps playing muted
+  // for a picture while a second, hidden <audio> carries the edited sound —
+  // that way hearing an edit never has to wait on a video re-encode.
+  const activeRender = renders.find((r) => r.id === previewSource) || null;
+  const previewingEdited = previewSource !== 'original' && activeRender !== null;
+  const dualTrack = Boolean(project?.hasVideo && previewingEdited && activeRender.format !== 'mp4');
+
   const togglePlay = useCallback(() => {
     const media = mediaRef.current;
     if (!media) return;
-    if (media.paused) media.play().catch(() => {});
-    else media.pause();
+    const audio = dualTrack ? editedAudioRef.current : null;
+    if (media.paused) {
+      media.play().catch(() => {});
+      audio?.play().catch(() => {});
+    } else {
+      media.pause();
+      audio?.pause();
+    }
+  }, [dualTrack]);
+
+  // Original and edited versions rarely share a timeline once words are cut
+  // or inserted, so switching between them starts over rather than trying to
+  // preserve a position that would land somewhere unrelated.
+  const switchPreview = useCallback((source) => {
+    mediaRef.current?.pause();
+    editedAudioRef.current?.pause();
+    setPreviewSource(source);
+    setCurrentTime(0);
   }, []);
 
   const seek = useCallback((time) => {
+    const clamped = Math.max(0, time);
     const media = mediaRef.current;
-    if (media) media.currentTime = Math.max(0, time);
-  }, []);
+    if (media) media.currentTime = clamped;
+    if (dualTrack && editedAudioRef.current) editedAudioRef.current.currentTime = clamped;
+  }, [dualTrack]);
 
   const activeIndex = useMemo(() => wordIndexAtTime(doc, currentTime), [doc, currentTime]);
   const cuts = useMemo(() => deletedSpans(doc), [doc]);
@@ -244,6 +279,8 @@ export default function Editor({ projectId, onBack }) {
         (update) => setRenderStage(update.status)
       );
       setResult(render);
+      setRenders((prev) => [render, ...prev]);
+      setPreviewSource(render.id);
       setProject(await api.getProject(projectId));
     } catch (renderError) {
       setError(renderError.message);
@@ -298,8 +335,25 @@ export default function Editor({ projectId, onBack }) {
     );
   }
 
-  const duration = project.duration ?? 0;
+  if (view === 'dub') {
+    return (
+      <DubStudio
+        projectId={projectId}
+        project={project}
+        onBack={() => setView('edit')}
+      />
+    );
+  }
+
+  const duration = previewingEdited ? activeRender.duration : (project.duration ?? 0);
   const estimated = plan?.estimatedDuration ?? stats.keptSeconds;
+
+  // The video element shows the edited render directly only when that
+  // render is itself an mp4; otherwise it shows the original picture (muted,
+  // when dualTrack) while the separate <audio> below carries the real sound.
+  const mediaSrc = previewingEdited && !dualTrack
+    ? api.downloadUrl(projectId, activeRender.id)
+    : api.mediaUrl(projectId);
 
   return (
     <div className="editor">
@@ -307,6 +361,9 @@ export default function Editor({ projectId, onBack }) {
         <button className="link" onClick={onBack}>← All projects</button>
         <h1 title={project.name}>{project.name}</h1>
         <div className="grow" />
+        {project.hasVideo && (
+          <button className="link" onClick={() => setView('dub')}>Translate &amp; Dub →</button>
+        )}
         <span className="muted small">
           {project.transcript.backend} · {project.transcript.language}
         </span>
@@ -317,8 +374,12 @@ export default function Editor({ projectId, onBack }) {
           <video
             ref={mediaRef}
             className="video"
-            src={api.mediaUrl(projectId)}
-            onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+            src={mediaSrc}
+            muted={dualTrack}
+            // In dualTrack mode the hidden <audio> below is the real clock —
+            // it carries the edited timeline, which runs a different length
+            // than the original video once words are cut or inserted.
+            onTimeUpdate={dualTrack ? undefined : (e) => setCurrentTime(e.currentTarget.currentTime)}
             onPlay={() => setPlaying(true)}
             onPause={() => setPlaying(false)}
             controls={false}
@@ -326,10 +387,19 @@ export default function Editor({ projectId, onBack }) {
         ) : (
           <audio
             ref={mediaRef}
-            src={api.mediaUrl(projectId)}
+            src={mediaSrc}
             onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
             onPlay={() => setPlaying(true)}
             onPause={() => setPlaying(false)}
+          />
+        )}
+
+        {dualTrack && (
+          <audio
+            ref={editedAudioRef}
+            src={api.downloadUrl(projectId, activeRender.id)}
+            onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+            style={{ display: 'none' }}
           />
         )}
 
@@ -348,6 +418,23 @@ export default function Editor({ projectId, onBack }) {
             {formatTime(currentTime)} / {formatTime(duration)}
           </span>
         </div>
+
+        {renders.length > 0 && (
+          <div className="preview-source">
+            <button
+              className={previewSource === 'original' ? 'active' : ''}
+              onClick={() => switchPreview('original')}
+            >
+              Original
+            </button>
+            <button
+              className={previewSource !== 'original' ? 'active' : ''}
+              onClick={() => switchPreview(renders[0].id)}
+            >
+              Edited
+            </button>
+          </div>
+        )}
       </section>
 
       <section className="toolbar">

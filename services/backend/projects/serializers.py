@@ -110,3 +110,36 @@ class EditRequestSerializer(serializers.Serializer):
     video = serializers.BooleanField(required=False, default=False)
     includeSegments = serializers.BooleanField(required=False, default=False)
     includeTokens = serializers.BooleanField(required=False, default=False)
+
+
+class TranslationSerializer(serializers.ModelSerializer):
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+    targetLanguage = serializers.CharField(source="target_language")
+    sourceLanguage = serializers.CharField(source="source_language")
+    translatedText = serializers.JSONField(source="translated_text", read_only=True)
+
+    class Meta:
+        from .models import Translation
+        model = Translation
+        fields = (
+            "id", "status", "error", "sourceLanguage", "targetLanguage",
+            "translatedText", "edits", "createdAt", "updatedAt",
+        )
+
+
+class DubRenderSerializer(serializers.ModelSerializer):
+    downloadUrl = serializers.SerializerMethodField()
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        from .models import DubRender
+        model = DubRender
+        fields = (
+            "id", "status", "error", "format", "file", "bytes", "duration",
+            "stats", "warnings", "synthesis", "createdAt", "downloadUrl",
+        )
+
+    def get_downloadUrl(self, obj) -> str | None:
+        # This would need context from the view to construct the full URL
+        return None

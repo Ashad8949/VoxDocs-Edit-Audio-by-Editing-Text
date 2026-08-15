@@ -6,7 +6,7 @@ word timings that produced a bad cut is the fastest way to understand why.
 
 from django.contrib import admin
 
-from .models import Project, Render, Segment, Word
+from .models import DubRender, Project, Render, Segment, Translation, VoiceProfile, Word
 
 
 class WordInline(admin.TabularInline):
@@ -33,6 +33,32 @@ class RenderAdmin(admin.ModelAdmin):
     list_filter = ("status", "format")
     search_fields = ("id", "project__id")
     readonly_fields = ("id", "created_at", "updated_at", "stats", "synthesis", "warnings")
+
+
+@admin.register(Translation)
+class TranslationAdmin(admin.ModelAdmin):
+    list_display = ("id", "project", "source_language", "target_language", "status", "created_at")
+    list_filter = ("status", "source_language", "target_language")
+    search_fields = ("id", "project__id")
+    readonly_fields = ("id", "created_at", "updated_at")
+    fields = ("id", "project", "source_language", "target_language", "status", "error", "translated_text", "edits", "created_at", "updated_at")
+
+
+@admin.register(DubRender)
+class DubRenderAdmin(admin.ModelAdmin):
+    list_display = ("id", "translation", "status", "format", "duration", "created_at")
+    list_filter = ("status", "format")
+    search_fields = ("id", "translation__id", "translation__project__id")
+    readonly_fields = ("id", "created_at", "updated_at", "stats", "synthesis", "warnings")
+    fields = ("id", "translation", "status", "error", "format", "file", "bytes", "duration", "stats", "synthesis", "warnings", "created_at", "updated_at")
+
+
+@admin.register(VoiceProfile)
+class VoiceProfileAdmin(admin.ModelAdmin):
+    list_display = ("project", "created_at", "updated_at")
+    search_fields = ("project__id",)
+    readonly_fields = ("created_at", "updated_at")
+    fields = ("project", "embedding", "pitch_info", "spectral_features", "supported_languages", "created_at", "updated_at")
 
 
 admin.site.register(Segment)

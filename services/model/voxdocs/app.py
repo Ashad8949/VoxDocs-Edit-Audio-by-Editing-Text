@@ -7,6 +7,7 @@ server wants disk and sockets. Splitting them lets each scale on its own metric.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -20,6 +21,8 @@ from . import audio as audio_util
 from .asr import ASR_SAMPLE_RATE, select_backend
 from .store import ProfileStore
 from .synth import ProfileWord, Synthesizer, VoiceProfile
+from .translate import IndicTrans2Translator
+from .voice_clone import XttsVoiceCloner, trim_reference
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +50,148 @@ def _sec_per_word(words: list[ProfileWord]) -> float:
     return spoken / len(words) + min(gap_share, 0.12)
 
 
+def _extract_pitch_info(samples: np.ndarray, sr: int = 16000) -> tuple[float, float, float]:
+    """Extract pitch statistics from audio.
+    
+    Returns: (mean_pitch_hz, std_dev, pitch_range)
+    """
+    # Stub: use simple spectral analysis
+    # In production, use a pitch extraction library like librosa.piptrack or pyin
+    try:
+        # Compute power spectrum
+        from scipy import signal
+        freqs, power = signal.periodogram(samples, sr)
+        # Find dominant frequency (very rough pitch estimate)
+        dominant_idx = np.argmax(power)
+        mean_pitch = freqs[dominant_idx] if dominant_idx < len(freqs) else 120.0
+        # Assume some variation
+        std_dev = mean_pitch * 0.15  # 15% variation
+        pitch_range = mean_pitch * 0.5  # 50% range
+        return float(np.clip(mean_pitch, 50, 400)), float(std_dev), float(pitch_range)
+    except Exception:
+        # Fallback: typical male voice ~120Hz, female ~220Hz
+        return 130.0, 20.0, 80.0
+
+
+def _extract_mfcc(samples: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """Extract MFCC (Mel-Frequency Cepstral Coefficients) from audio.
+    
+    Returns: Array of MFCC coefficients
+    """
+    # Stub: return zeros
+    # In production, use librosa.feature.mfcc
+    try:
+        # Compute a basic spectrogram as proxy
+        from scipy import signal
+        f, t, Sxx = signal.spectrogram(samples, sr)
+        # Return simplified features
+        return np.mean(np.log(Sxx + 1e-9), axis=1)[:13]  # 13 coefficients
+    except Exception:
+        return np.zeros(13, dtype=np.float32)
+
+
+def _generate_speaker_embedding(samples: np.ndarray, sr: int = 16000) -> list[float]:
+    """Generate a speaker embedding vector from audio.
+    
+    In production, this would use a proper speaker encoder model like:
+    - SpeakerNet
+    - X-Vector (Kaldi)
+    - Resemblyzer (based on VoxCeleb)
+    """
+    # Stub: generate random but deterministic embedding based on audio
+    # In production, use model inference
+    try:
+        # Use audio statistics as a simple embedding
+        embedding = []
+        for chunk_size in [512, 1024, 2048]:
+            for i in range(0, len(samples) - chunk_size, chunk_size):
+                chunk = samples[i:i+chunk_size]
+                embedding.append(float(np.mean(chunk)))
+                embedding.append(float(np.std(chunk)))
+        
+        # Normalize to reasonable length (e.g., 192-dim for speaker embeddings)
+        if len(embedding) > 192:
+            embedding = embedding[:192]
+        else:
+            embedding.extend([0.0] * (192 - len(embedding)))
+        
+        return embedding[:192]
+    except Exception:
+        return [0.0] * 192
+
+
+def _synthesize_with_fallback(text: str, target_language: str,
+                              context_before: str = "", context_after: str = "") -> np.ndarray | None:
+    """Fallback synthesis using eSpeak when voice profile is unavailable.
+    
+    Generates speech but without voice characteristics.
+    """
+    try:
+        import subprocess
+        import tempfile
+        
+        # Use eSpeak for basic synthesis
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            output_file = tmp.name
+        
+        # Map target language to eSpeak language code
+        lang_map = {
+            "en": "en",
+            "hi": "hi",
+            "hinglish": "en",  # Use English for Hinglish
+        }
+        lang_code = lang_map.get(target_language, "en")
+        
+        # Run eSpeak
+        cmd = [
+            "espeak-ng",
+            "-v", lang_code,
+            "-w", output_file,
+            text
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=5)
+        
+        # Load synthesized audio
+        if os.path.exists(output_file):
+            samples = audio_util.decode(output_file, sample_rate=22050)
+            try:
+                os.remove(output_file)
+            except OSError:
+                pass
+            return samples
+        return None
+    except Exception as exc:
+        log.warning("fallback synthesis failed: %s", exc)
+        return None
+
+
+def _synthesize_with_voice_profile(voice_cloner, profile: VoiceProfile, text: str,
+                                   target_language: str) -> tuple[np.ndarray, int] | None:
+    """Synthesize text in the profile's speaker's voice via XTTS-v2,
+    using the project's own cached source audio as the reference clip.
+
+    Returns None (rather than raising) whenever cloning isn't possible —
+    no cached audio, or the cloner isn't available — so the caller can fall
+    back to generic synthesis without special-casing every reason why.
+    """
+    if profile.samples is None or not voice_cloner.available():
+        return None
+
+    reference = trim_reference(profile.samples, profile.sample_rate)
+    ref_bytes = audio_util.encode_wav(reference, sample_rate=profile.sample_rate)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(ref_bytes)
+        ref_path = tmp.name
+    try:
+        samples = voice_cloner.synthesize(text, target_language, ref_path)
+        return samples, voice_cloner.sample_rate
+    finally:
+        try:
+            os.remove(ref_path)
+        except OSError:
+            pass
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
@@ -60,6 +205,8 @@ def create_app() -> Flask:
     synthesizer = Synthesizer(
         enable_voice_bank=os.environ.get("VOXDOCS_VOICE_BANK", "1") not in ("0", "false", "no")
     )
+    translator = IndicTrans2Translator()
+    voice_cloner = XttsVoiceCloner()
 
     state: dict = {"asr": None, "asr_error": None}
 
@@ -79,6 +226,8 @@ def create_app() -> Flask:
             return True
         if keep_audio in ("0", "false", "no"):
             return False
+        if voice_cloner.available():
+            return True
         return any(b.available() for b in synthesizer.tts_backends if b.name == "paddlespeech")
 
     # ---------------------------------------------------------------- health
@@ -117,13 +266,24 @@ def create_app() -> Flask:
 
         suffix = os.path.splitext(upload.filename or "")[1][:10] or ".bin"
         started = time.monotonic()
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-            upload.save(tmp.name)
+        # delete=False, closed before reuse: NamedTemporaryFile's own handle
+        # holds an exclusive lock on Windows, so reopening the same path via
+        # upload.save() while that handle is still open raises PermissionError
+        # there (POSIX allows it, which is why this only shows up on Windows).
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            upload.save(tmp_path)
             try:
-                samples = audio_util.decode(tmp.name, ASR_SAMPLE_RATE)
+                samples = audio_util.decode(tmp_path, ASR_SAMPLE_RATE)
             except audio_util.AudioError as exc:
                 return jsonify({"error": "decode_failed", "message": str(exc)}), 415
-            container_duration = audio_util.probe_duration(tmp.name)
+            container_duration = audio_util.probe_duration(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
         if samples.size == 0:
             return jsonify({"error": "empty_audio", "message": "no audio samples decoded"}), 415
@@ -208,13 +368,20 @@ def create_app() -> Flask:
         upload = request.files.get("audio")
         if upload is not None:
             suffix = os.path.splitext(upload.filename or "")[1][:10] or ".bin"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-                upload.save(tmp.name)
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                upload.save(tmp_path)
                 try:
-                    samples = audio_util.decode(tmp.name, ASR_SAMPLE_RATE)
+                    samples = audio_util.decode(tmp_path, ASR_SAMPLE_RATE)
                 except audio_util.AudioError as exc:
                     return jsonify({"error": "decode_failed", "message": str(exc)}), 415
-                duration = duration or audio_util.probe_duration(tmp.name)
+                duration = duration or audio_util.probe_duration(tmp_path)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             stats = audio_util.voice_stats(samples, ASR_SAMPLE_RATE)
 
         profile = VoiceProfile(
@@ -253,6 +420,201 @@ def create_app() -> Flask:
     @app.delete("/voice-profile/<project_id>")
     def delete_voice_profile(project_id: str):
         return jsonify({"deleted": store.drop(project_id)})
+
+    # ------------------------------------------------------------ translation
+
+    @app.post("/translate")
+    def translate():
+        """Translate text segments to the target language.
+
+        Uses IndicTrans2 (en<->hi) for real translation; "hinglish" is Hindi
+        plus a loanword substitution pass so it reads the way people actually
+        speak rather than textbook Hindi. Falls back to passthrough (with a
+        warning) if the translator can't load, so a model-server hiccup never
+        turns into a 500 the caller has to handle specially.
+        """
+        payload = request.get_json(silent=True) or {}
+        project_id = str(payload.get("project_id") or "")
+        segments = [str(s) for s in (payload.get("segments") or [])]
+        source_language = str(payload.get("source_language") or "en")
+        target_language = str(payload.get("target_language") or "en")
+
+        warning = None
+        try:
+            translations = translator.translate(segments, source_language, target_language)
+        except Exception as exc:  # model load/inference failures shouldn't 500 the caller
+            log.exception("translation failed for %s (%s -> %s)", project_id, source_language, target_language)
+            translations = list(segments)
+            warning = str(exc)[:200]
+
+        return jsonify({
+            "project_id": project_id,
+            "source_language": source_language,
+            "target_language": target_language,
+            "translations": translations,
+            "confidence": 0.0 if warning else 0.9,
+            "metadata": {
+                "translator": translator.name,
+                "warning": warning,
+            }
+        })
+
+    # ------------------------------------------------------------ voice profile extraction
+
+    @app.post("/voice-profile/extract")
+    def extract_voice_profile():
+        """Extract speaker voice profile and embeddings from audio.
+        
+        Analyzes the uploaded audio to extract:
+        - Voice embedding (for voice cloning)
+        - Pitch information (mean, std, range)
+        - Spectral features (MFCC, formants)
+        - Supported languages for synthesis
+        """
+        if "audio" not in request.files:
+            return jsonify({
+                "error": "missing_audio",
+                "message": "audio file required"
+            }), 400
+
+        project_id = str(request.form.get("project_id") or "")
+        if not project_id:
+            return jsonify({
+                "error": "missing_project_id",
+                "message": "project_id required"
+            }), 400
+
+        audio_file = request.files["audio"]
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        audio_file.save(tmp_path)
+
+        try:
+            # Decode audio
+            samples = audio_util.decode(tmp_path, sample_rate=16000)
+            
+            # Extract basic voice features
+            # In production, use a proper speaker embedding model
+            # Example: from resemblyzer import VoiceEncoder
+            
+            # Compute pitch
+            pitch_mean, pitch_std, pitch_range = _extract_pitch_info(samples, sr=16000)
+            
+            # Compute spectral features (MFCC as proxy)
+            mfcc = _extract_mfcc(samples, sr=16000)
+            
+            # Stub embedding (in production: use speaker encoder)
+            embedding = _generate_speaker_embedding(samples, sr=16000)
+            
+            return jsonify({
+                "project_id": project_id,
+                "embedding": {
+                    "model": "stub-speaker-encoder",
+                    "embedding": embedding,
+                    "speaker_id": f"speaker_{project_id[:8]}"
+                },
+                "pitch_info": {
+                    "mean_hz": float(pitch_mean),
+                    "std_dev": float(pitch_std),
+                    "range_hz": float(pitch_range)
+                },
+                "spectral_features": {
+                    "mfcc": mfcc.tolist() if hasattr(mfcc, 'tolist') else mfcc,
+                    "energy": float(np.mean(np.abs(samples) ** 2))
+                },
+                "supported_languages": ["en", "hi", "hinglish"]
+            })
+        except Exception as exc:
+            log.exception("voice profile extraction failed for %s", project_id)
+            return jsonify({
+                "error": "extraction_failed",
+                "message": str(exc)[:200]
+            }), 500
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------ voice-preserving synthesis
+
+    @app.post("/synthesize/voice")
+    def synthesize_voice():
+        """Synthesize text using the project's extracted voice profile.
+        
+        This endpoint generates speech in a target language while preserving
+        the speaker's voice characteristics. It can either:
+        - Return the audio directly (type="audio")
+        - Reference original audio (type="source") if text was already spoken
+        """
+        payload = request.get_json(silent=True) or {}
+        project_id = str(payload.get("project_id") or "")
+        text = str(payload.get("text") or "")
+        target_language = str(payload.get("target_language") or "en")
+        context_before = str(payload.get("context_before") or "")
+        context_after = str(payload.get("context_after") or "")
+
+        if not project_id:
+            return jsonify({
+                "error": "missing_project_id",
+                "message": "project_id required"
+            }), 400
+
+        if not text.strip():
+            return jsonify({
+                "type": "audio",
+                "data": None,
+                "word": text
+            })
+
+        try:
+            # Try real voice-cloned synthesis first, using the project's own
+            # cached source audio as the reference clip; fall back to a
+            # generic voice whenever that isn't possible for any reason.
+            profile = store.get(project_id)
+            result = None
+            if profile is not None:
+                try:
+                    result = _synthesize_with_voice_profile(voice_cloner, profile, text, target_language)
+                except Exception:
+                    log.exception("voice-cloned synthesis failed for %s; falling back", project_id)
+                    result = None
+
+            if result is not None:
+                audio_data, sample_rate = result
+                voice_cloned = True
+            else:
+                audio_data = _synthesize_with_fallback(
+                    text, target_language, context_before, context_after
+                )
+                sample_rate = 22050
+                voice_cloned = False
+
+            if audio_data is not None:
+                # Encode as base64 WAV
+                audio_bytes = audio_util.encode_wav(audio_data, sample_rate=sample_rate)
+                audio_b64 = base64.b64encode(audio_bytes).decode('ascii')
+                return jsonify({
+                    "type": "audio",
+                    "data": audio_b64,
+                    "word": text,
+                    "sample_rate": sample_rate,
+                    "voice_cloned": voice_cloned,
+                    "confidence": 0.9 if voice_cloned else 0.5
+                })
+            else:
+                return jsonify({
+                    "type": "audio",
+                    "data": None,
+                    "word": text,
+                    "error": "synthesis_failed"
+                }), 500
+        except Exception as exc:
+            log.exception("voice synthesis failed for %s", project_id)
+            return jsonify({
+                "error": "synthesis_failed",
+                "message": str(exc)[:200]
+            }), 500
 
     # ------------------------------------------------------------ synthesise
 

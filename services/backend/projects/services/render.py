@@ -44,6 +44,11 @@ class RenderOp:
     gain: float = 1.0
     file: Path | None = None
     label: str = ""
+    # Set only by dubbing: stretch/compress this op's audio (via atempo) to
+    # land on exactly this many seconds, so a translation that runs long or
+    # short never shifts every segment after it out of sync with the video,
+    # which is never re-cut.
+    target_duration: float | None = None
 
     @property
     def audible(self) -> bool:
@@ -118,20 +123,51 @@ def expand_segments(segments, synthesis: dict[int, dict],
     return [op for op in ops if op.audible], warnings
 
 
+def _natural_duration(op: RenderOp, file_cache: dict[Path, float]) -> float:
+    """The op's real duration before any dub time-stretch is applied."""
+    if op.kind == "source":
+        return op.end - op.start
+    if op.kind == "silence":
+        return op.duration
+    if op.file not in file_cache:
+        file_cache[op.file] = duration_of(op.file)
+    return file_cache[op.file]
+
+
 def op_durations(ops: list[RenderOp]) -> list[float]:
-    """Exact duration of every op; only inline files need probing."""
+    """Exact output duration of every op — the stretched length when a dub
+    op carries a target_duration, its natural length otherwise.
+    """
     cache: dict[Path, float] = {}
-    durations = []
-    for op in ops:
-        if op.kind == "source":
-            durations.append(op.end - op.start)
-        elif op.kind == "silence":
-            durations.append(op.duration)
-        else:
-            if op.file not in cache:
-                cache[op.file] = duration_of(op.file)
-            durations.append(cache[op.file])
-    return durations
+    return [
+        op.target_duration if op.target_duration is not None else _natural_duration(op, cache)
+        for op in ops
+    ]
+
+
+def _atempo_chain(natural: float, target: float) -> str:
+    """Filter fragment to stretch/compress audio from `natural` to `target`
+    seconds — how dubbing keeps a translation's timing locked to its
+    original slot without ever touching the video. atempo's single-filter
+    range is [0.5, 2.0]; outside that, chain stages whose product is the
+    overall tempo needed.
+    """
+    if natural <= 0 or target <= 0:
+        return ""
+    tempo = natural / target
+    if abs(tempo - 1.0) < 0.01:
+        return ""  # close enough that stretching would only add artifacts
+
+    stages = []
+    remaining = tempo
+    while remaining > 2.0:
+        stages.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        stages.append(0.5)
+        remaining /= 0.5
+    stages.append(remaining)
+    return "," + ",".join(f"atempo={s:.6f}" for s in stages)
 
 
 def _fade_chain(fade_in: float, fade_out: float, duration: float) -> str:
@@ -165,6 +201,7 @@ def render_ops(master: Path, ops: list[RenderOp], output: Path,
         return _render_in_batches(master, ops, output, fade, rate)
 
     durations = op_durations(ops)
+    file_cache: dict[Path, float] = {}
     inputs = ["-i", str(master)]
     input_index_by_file: dict[Path, int] = {}
     for op in ops:
@@ -183,18 +220,22 @@ def render_ops(master: Path, ops: list[RenderOp], output: Path,
         fade_in = min(fade, duration / 2) if i > 0 else 0.0
         fade_out = min(fade, duration / 2) if i < len(ops) - 1 else 0.0
         fades = _fade_chain(fade_in, fade_out, duration)
+        stretch = (
+            _atempo_chain(_natural_duration(op, file_cache), op.target_duration)
+            if op.target_duration is not None else ""
+        )
 
         if op.kind == "source":
             filters = [f"atrim=start={op.start:.6f}:end={op.end:.6f}", "asetpts=N/SR/TB"]
             if abs(op.gain - 1.0) > 0.001:
                 filters.append(f"volume={op.gain:.4f}")
-            lines.append(f"[0:a]{','.join(filters)}{fades}[{label}];")
+            lines.append(f"[0:a]{','.join(filters)}{stretch}{fades}[{label}];")
         elif op.kind == "file":
             index = input_index_by_file[op.file]
             lines.append(
                 f"[{index}:a]aresample={rate},"
                 f"aformat=sample_fmts=fltp:channel_layouts=mono,"
-                f"asetpts=N/SR/TB{fades}[{label}];"
+                f"asetpts=N/SR/TB{stretch}{fades}[{label}];"
             )
         else:
             lines.append(
