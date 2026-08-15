@@ -83,7 +83,7 @@ export default function DubStudio({ projectId, project, onBack }) {
               <dt>Status:</dt>
               <dd className={`status-${translation.status}`}>{translation.status}</dd>
               <dt>Created:</dt>
-              <dd>{new Date(translation.createdAt).toLocaleDateString()}</dd>
+              <dd>{translation.createdAt ? new Date(translation.createdAt).toLocaleDateString() : '—'}</dd>
             </dl>
           </div>
         )}

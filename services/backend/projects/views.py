@@ -416,6 +416,7 @@ def project_translate(request, project_id: str):
                 "status": translation.status,
                 "targetLanguage": translation.target_language,
                 "sourceLanguage": translation.source_language,
+                "createdAt": translation.created_at.isoformat(),
             }
         },
         status=202,
@@ -487,6 +488,7 @@ def translation_detail(request, project_id: str, translation_id: str):
                 "error": translation.error,
                 "segments": response_segments,
                 "edits": translation.edits,
+                "createdAt": translation.created_at.isoformat(),
             }
         }
     )
