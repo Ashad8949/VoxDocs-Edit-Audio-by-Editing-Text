@@ -188,14 +188,17 @@ try:
     EXP_NAME = "voxdocs_" + PROJECT_ID
     sr_tag = "40k" if SR == 40000 else "48k"
     exp_path = os.path.join(RVC_DIR, "logs", EXP_NAME)
-    # Exact CLI from the repo's webui.py (new ./train/ layout).
-    sh(f'{sys.executable} train/preprocess.py "{train_dir}" {SR} 2 "{exp_path}" False 3.0')
-    sh(f'{sys.executable} train/dataset/extract_f0.py cpu "{exp_path}" 2 rmvpe')
-    sh(f'{sys.executable} train/dataset/extract_hubert_feature.py cpu 1 0 "{exp_path}" v2 False')
-    sh(f'{sys.executable} train/train.py -e "{EXP_NAME}" -sr {sr_tag} -f0 1 -bs 8 -g 0 '
+    # Run as modules (-m), not scripts: the training files import each other as
+    # `train.*` / `infer.*`, so running "python train/preprocess.py" makes
+    # `train` both a script context and a package and self-collides (circular
+    # import). "-m train.preprocess" from the repo root imports them cleanly.
+    sh(f'{sys.executable} -m train.preprocess "{train_dir}" {SR} 2 "{exp_path}" False 3.0')
+    sh(f'{sys.executable} -m train.dataset.extract_f0 cpu "{exp_path}" 2 rmvpe')
+    sh(f'{sys.executable} -m train.dataset.extract_hubert_feature cpu 1 0 "{exp_path}" v2 False')
+    sh(f'{sys.executable} -m train.train -e "{EXP_NAME}" -sr {sr_tag} -f0 1 -bs 8 -g 0 '
        f'-te {EPOCHS} -se 50 -pg assets/pretrained_v2/f0G40k.pth '
        f'-pd assets/pretrained_v2/f0D40k.pth -l 0 -c 0 -sw 1 -v v2')
-    subprocess.run(f'{sys.executable} train/train_index.py "{EXP_NAME}" v2 "{exp_path}" 4 auto',
+    subprocess.run(f'{sys.executable} -m train.train_index "{EXP_NAME}" v2 "{exp_path}" 4 auto',
                    shell=True)
 
     for src in glob.glob(f"assets/weights/{EXP_NAME}*.pth"):
