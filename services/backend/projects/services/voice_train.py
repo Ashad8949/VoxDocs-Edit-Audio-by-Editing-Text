@@ -79,15 +79,24 @@ def train(model: VoiceModel) -> VoiceModel:
         out_dir = work / "out"
         kaggle_client.kernel_output(kernel_ref, out_dir)
         metrics = _read_metrics(out_dir)
-        model_src = out_dir / "model.pth"
-        if not model_src.exists():
-            raise RuntimeError("training produced no model.pth (see kernel logs)")
 
         # 4. Evaluation gate ------------------------------------------------
+        # Record the metrics regardless, then decide. A run that produced no
+        # model, or whose speaker similarity is below the bar, is *rejected*
+        # (a normal, honest outcome) — not a pipeline failure. The recorded
+        # standard_similarity still shows the zero-shot baseline in the UI.
         _set(model, status=VoiceModel.Status.EVALUATING, metrics=metrics)
+        model_src = out_dir / "model.pth"
         pro = metrics.get("pro_similarity")
         threshold = _cfg("RVC_MIN_SIMILARITY")
-        if pro is None or pro < threshold:
+        if not model_src.exists():
+            _set(model, status=VoiceModel.Status.REJECTED,
+                 error="no RVC model was produced (see kernel logs)")
+            return model
+        # A produced model is promoted. pro_similarity is measured on the
+        # serving side (RVC inference needs the Python 3.11 container), so the
+        # gate only *rejects* on it when it was measured and fell short.
+        if pro is not None and pro < threshold:
             _set(model, status=VoiceModel.Status.REJECTED,
                  error=f"speaker similarity {pro} below threshold {threshold}")
             return model

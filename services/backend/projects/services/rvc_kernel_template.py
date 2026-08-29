@@ -110,81 +110,12 @@ sf.write(os.path.join(train_dir, "speaker.wav"), train_y, SR)
 real_holdout = os.path.join(WORK, "real_holdout.wav")
 sf.write(real_holdout, holdout_y, SR)
 
-# --- 3. RVC training -------------------------------------------------------
-# Canonical RVC-Project flow: preprocess -> extract F0/features -> train ->
-# build faiss index. CLI arg shapes vary by RVC fork; iterate against logs.
-RVC_DIR = os.path.join(SCRATCH, "rvc")
-model_out = os.path.join(WORK, "model.pth")
-index_out = os.path.join(WORK, "added.index")
-trained = False
-try:
-    # No --recurse-submodules: the repo's realtime-VST submodule drags in a
-    # huge tree of C++ audio-plugin SDKs we don't need (and which blows up the
-    # clone). The Python training scripts live in the main repo's infer/ tree,
-    # which the glob below locates.
-    subprocess.run(
-        f"git clone --depth 1 "
-        f"https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI {RVC_DIR}",
-        shell=True, check=True)
-    os.chdir(RVC_DIR)
-    print("RVC repo top-level:", os.listdir("."), flush=True)
-
-    # The repo layout drifts between revisions, so locate the training entry
-    # points by name instead of hard-coding paths; skip RVC gracefully (the
-    # eval below still runs) if this revision doesn't ship them.
-    def find(name):
-        hits = glob.glob(f"./**/{name}", recursive=True)
-        return hits[0] if hits else None
-
-    preprocess = find("preprocess.py")
-    extract_f0 = find("extract_f0_rmvpe.py")
-    extract_feat = find("extract_feature_print.py")
-    train_py = find("train.py")
-    print("RVC scripts:", preprocess, extract_f0, extract_feat, train_py, flush=True)
-
-    if all([preprocess, extract_f0, extract_feat, train_py]):
-        req = find("requirements.txt")
-        if req:
-            subprocess.run(f"{sys.executable} -m pip install -q -r {req}", shell=True)
-        for asset, url in [
-            ("assets/hubert/hubert_base.pt",
-             "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt"),
-            ("assets/rmvpe/rmvpe.pt",
-             "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt"),
-        ]:
-            if not os.path.exists(asset):
-                os.makedirs(os.path.dirname(asset), exist_ok=True)
-                subprocess.run(f"wget -q -O {asset} {url}", shell=True)
-
-        EXP_NAME = "voxdocs_" + PROJECT_ID
-        sr_tag = "40k" if SR == 40000 else "48k"
-        sh(f"{sys.executable} {preprocess} {train_dir} {SR} 2 ./logs/{EXP_NAME} False 3.0")
-        sh(f"{sys.executable} {extract_f0} 1 0 0 ./logs/{EXP_NAME} True")
-        sh(f"{sys.executable} {extract_feat} cuda:0 1 0 ./logs/{EXP_NAME} v2 True")
-        sh(f"{sys.executable} {train_py} -e {EXP_NAME} -sr {sr_tag} "
-           f"-f0 1 -bs 8 -te {EPOCHS} -se 50 -sw 1 -v v2 -l 0 -c 0")
-        idx = find("train_index.py")
-        if idx:
-            subprocess.run(f"{sys.executable} {idx} {EXP_NAME} v2", shell=True)
-
-        for src in (glob.glob(f"./assets/weights/{EXP_NAME}*.pth")
-                    + sorted(glob.glob(f"./logs/{EXP_NAME}/G_*.pth"))):
-            shutil.copy(src, model_out); trained = True; break
-        for src in glob.glob(f"./logs/{EXP_NAME}/added_*.index"):
-            shutil.copy(src, index_out); break
-    else:
-        print("RVC training scripts not found in this revision — skipping RVC; "
-              "eval will still report standard (zero-shot) similarity.", flush=True)
-except Exception as e:
-    print("RVC training step failed:", repr(e), flush=True)
-finally:
-    os.chdir(WORK)
-
-# --- 4. Evaluation gate: speaker similarity --------------------------------
-# Content-independent speaker embeddings (Resemblyzer); cosine similarity of a
-# held-out REAL clip vs (a) zero-shot XTTS and (b) trained RVC output.
+# --- 3. Baseline eval (before RVC touches torch) ---------------------------
+# Zero-shot XTTS clone vs a held-out REAL clip, compared with content-agnostic
+# speaker embeddings (Resemblyzer). Done first so the RVC step's torch reinstall
+# can't disturb this number.
 from resemblyzer import VoiceEncoder, preprocess_wav
-enc = VoiceEncoder(DEVICE)
+enc = VoiceEncoder("cpu")
 
 
 def emb(path):
@@ -194,34 +125,81 @@ def emb(path):
 def cos(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-metrics = {"epochs": EPOCHS, "sample_rate": SR, "trained": trained}
+metrics = {"epochs": EPOCHS, "sample_rate": SR, "trained": False}
+speaker_wav = os.path.join(train_dir, "speaker.wav")
+xtts_out = os.path.join(WORK, "xtts_out.wav")
 try:
-    from TTS.api import TTS
     os.environ["COQUI_TOS_AGREED"] = "1"
+    from TTS.api import TTS
     tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-    xtts_out = os.path.join(WORK, "xtts_out.wav")
-    tts.tts_to_file(text=EVAL_TEXT, speaker_wav=os.path.join(train_dir, "speaker.wav"),
-                    language="en", file_path=xtts_out)
+    tts.tts_to_file(text=EVAL_TEXT, speaker_wav=speaker_wav, language="en", file_path=xtts_out)
     real_e = emb(real_holdout)
     metrics["standard_similarity"] = round(cos(real_e, emb(xtts_out)), 4)
-
-    # RVC conversion of the XTTS output, if a model was produced.
-    if trained and os.path.exists(model_out):
-        try:
-            sh(f"{sys.executable} -m pip install -q rvc-python")
-            from rvc_python.infer import RVCInference
-            rvc = RVCInference(model_path=model_out,
-                               index_path=index_out if os.path.exists(index_out) else "")
-            rvc_out = os.path.join(WORK, "rvc_out.wav")
-            rvc.infer_file(xtts_out, rvc_out)
-            metrics["pro_similarity"] = round(cos(real_e, emb(rvc_out)), 4)
-        except Exception as e:
-            print("RVC eval inference failed:", e, flush=True)
-            metrics["pro_error"] = str(e)[:300]
 except Exception as e:
-    print("eval failed:", e, flush=True)
+    print("baseline eval failed:", repr(e), flush=True)
     metrics["eval_error"] = str(e)[:300]
 
+# --- 4. RVC training -------------------------------------------------------
+# Invocations mirror the repo's own webui.py exactly (train/ layout). The repo
+# ships a cu118 requirements set whose torch supports the P100 (sm_60), which
+# the default container torch does not — installing it is what makes GPU
+# training work here.
+RVC_DIR = os.path.join(SCRATCH, "rvc")
+model_out = os.path.join(WORK, "model.pth")
+index_out = os.path.join(WORK, "added.index")
+trained = False
+try:
+    subprocess.run(
+        f"git clone --depth 1 "
+        f"https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI {RVC_DIR}",
+        shell=True, check=True)
+    os.chdir(RVC_DIR)
+    print("RVC repo top-level:", os.listdir("."), flush=True)
+
+    req = "requirments_cu118_py312.txt"
+    if os.path.exists(req):
+        subprocess.run(f"{sys.executable} -m pip install -q -r {req}", shell=True)
+
+    base = "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main"
+    for asset, url in [
+        ("assets/hubert/hubert_base.pt", f"{base}/hubert_base.pt"),
+        ("assets/rmvpe/rmvpe.pt", f"{base}/rmvpe.pt"),
+        ("assets/pretrained_v2/f0G40k.pth", f"{base}/pretrained_v2/f0G40k.pth"),
+        ("assets/pretrained_v2/f0D40k.pth", f"{base}/pretrained_v2/f0D40k.pth"),
+    ]:
+        os.makedirs(os.path.dirname(asset), exist_ok=True)
+        if not os.path.exists(asset):
+            subprocess.run(f"wget -q -O {asset} {url}", shell=True)
+
+    EXP_NAME = "voxdocs_" + PROJECT_ID
+    sr_tag = "40k" if SR == 40000 else "48k"
+    exp_path = os.path.join(RVC_DIR, "logs", EXP_NAME)
+    # Exact CLI from the repo's webui.py (new ./train/ layout).
+    sh(f'{sys.executable} train/preprocess.py "{train_dir}" {SR} 2 "{exp_path}" False 3.0')
+    sh(f'{sys.executable} train/dataset/extract_f0.py cpu "{exp_path}" 2 rmvpe')
+    sh(f'{sys.executable} train/dataset/extract_hubert_feature.py cpu 1 0 "{exp_path}" v2 False')
+    sh(f'{sys.executable} train/train.py -e "{EXP_NAME}" -sr {sr_tag} -f0 1 -bs 8 -g 0 '
+       f'-te {EPOCHS} -se 50 -pg assets/pretrained_v2/f0G40k.pth '
+       f'-pd assets/pretrained_v2/f0D40k.pth -l 0 -c 0 -sw 1 -v v2')
+    subprocess.run(f'{sys.executable} train/train_index.py "{EXP_NAME}" v2 "{exp_path}" 4 auto',
+                   shell=True)
+
+    for src in glob.glob(f"assets/weights/{EXP_NAME}*.pth"):
+        shutil.copy(src, model_out); trained = True; break
+    for src in glob.glob(os.path.join(exp_path, "added_*.index")):
+        shutil.copy(src, index_out); break
+    print("RVC trained:", trained, flush=True)
+except Exception as e:
+    print("RVC training step failed:", repr(e), flush=True)
+finally:
+    os.chdir(WORK)
+
+metrics["trained"] = trained
+
+# --- 5. Write results ------------------------------------------------------
+# pro_similarity (RVC vs real) is measured on the serving side (the Python 3.11
+# container), where RVC inference runs; the kernel's job is to produce the
+# model and the zero-shot baseline.
 with open(os.path.join(WORK, "metrics.json"), "w") as fh:
     json.dump(metrics, fh)
 print("METRICS", json.dumps(metrics), flush=True)
