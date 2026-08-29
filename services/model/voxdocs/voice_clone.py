@@ -80,9 +80,13 @@ class XttsVoiceCloner:
             self._tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(self.device)
             return self._tts
 
-    def synthesize(self, text: str, target_language: str, speaker_wav_path: str) -> np.ndarray:
+    def synthesize(self, text: str, target_language: str,
+                   speaker_wav_path: str | list[str]) -> np.ndarray:
         """Returns float32 samples at `self.sample_rate` for `text`, spoken
         in the reference speaker's voice, in `target_language`.
+
+        `speaker_wav_path` may be a single clip or a list of clips — XTTS
+        averages the speaker conditioning across all of them.
         """
         tts = self._load()
         lang = _LANGUAGE_MAP.get(target_language, "en")
@@ -97,3 +101,87 @@ def trim_reference(samples: np.ndarray, sample_rate: int,
     if samples.shape[0] <= max_samples:
         return samples
     return samples[:max_samples]
+
+
+# A reference clip shorter than this is too little context to condition on
+# well; longer than this and one clip crowds out variety from elsewhere.
+MIN_CLIP_SECONDS = 2.0
+MAX_CLIP_SECONDS = 12.0
+# Words further apart than this start a new clip — a pause that long usually
+# means a sentence boundary, and splicing across it into one clip sounds odd.
+CLIP_GAP_SECONDS = 0.6
+# Below this the transcriber wasn't sure what it heard; such spans tend to be
+# noise, crosstalk or mumbling — poor material to clone a voice from.
+MIN_CONFIDENCE = 0.5
+
+
+def select_reference_clips(
+    samples: np.ndarray,
+    sample_rate: int,
+    words: list[tuple[float, float, float]],
+    max_seconds: float = MAX_REFERENCE_SECONDS,
+    max_clips: int = 3,
+) -> list[np.ndarray]:
+    """Pick a few clean, confident, contiguous speech spans to clone from.
+
+    XTTS conditions on a reference clip; the closer that clip is to clear,
+    representative speech, the better the clone. The old "first 30 seconds"
+    could easily land on silence, an intro sting or a throat-clear. Here we
+    use the transcript's own per-word confidence and timings (``words`` is a
+    list of ``(start, end, confidence)``) to find the best material, and
+    return several spans since XTTS accepts multiple reference clips.
+
+    Falls back to a plain head trim when there is no usable word timing.
+    """
+    if samples.size == 0:
+        return []
+    if not words:
+        return [trim_reference(samples, sample_rate, max_seconds)]
+
+    # Group consecutive words into runs, breaking on a long pause or a word
+    # the transcriber flagged as low-confidence.
+    runs: list[list[tuple[float, float, float]]] = []
+    current: list[tuple[float, float, float]] = []
+    prev_end = None
+    for start, end, conf in words:
+        if conf < MIN_CONFIDENCE or (prev_end is not None and start - prev_end > CLIP_GAP_SECONDS):
+            if current:
+                runs.append(current)
+            current = []
+        if conf >= MIN_CONFIDENCE:
+            current.append((start, end, conf))
+        prev_end = end
+    if current:
+        runs.append(current)
+
+    # Score each run: prefer high confidence, then longer spans. Cap each run
+    # to MAX_CLIP_SECONDS so one monologue can't monopolise the budget.
+    spans: list[tuple[float, float, float]] = []  # (start, end, mean_conf)
+    for run in runs:
+        start = run[0][0]
+        end = min(run[-1][1], start + MAX_CLIP_SECONDS)
+        if end - start < MIN_CLIP_SECONDS:
+            continue
+        mean_conf = float(np.mean([c for _, _, c in run]))
+        spans.append((start, end, mean_conf))
+
+    if not spans:
+        return [trim_reference(samples, sample_rate, max_seconds)]
+
+    spans.sort(key=lambda s: (s[2], s[1] - s[0]), reverse=True)
+
+    clips: list[np.ndarray] = []
+    total = 0.0
+    for start, end, _ in spans:
+        if len(clips) >= max_clips or total >= max_seconds:
+            break
+        end = min(end, start + (max_seconds - total))
+        if end - start < MIN_CLIP_SECONDS:
+            continue
+        lo = max(0, int(start * sample_rate))
+        hi = min(samples.shape[0], int(end * sample_rate))
+        if hi - lo > 0:
+            clips.append(samples[lo:hi])
+            total += (hi - lo) / sample_rate
+
+    return clips or [trim_reference(samples, sample_rate, max_seconds)]

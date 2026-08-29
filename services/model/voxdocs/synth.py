@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import audio as audio_util
-from .voice_clone import XttsVoiceCloner, trim_reference
+from .voice_clone import XttsVoiceCloner, select_reference_clips
 
 log = logging.getLogger(__name__)
 
@@ -395,13 +395,52 @@ class XttsBackend(TtsBackend):
         if profile.samples is None:
             raise RuntimeError("voice cloning needs the source audio; none was cached")
 
-        reference = trim_reference(profile.samples, profile.sample_rate)
+        # Condition on the cleanest, most confident speech in the recording —
+        # several short clips beat one arbitrary head slice (see
+        # select_reference_clips).
+        clips = select_reference_clips(
+            profile.samples,
+            profile.sample_rate,
+            [(w.start, w.end, w.confidence) for w in profile.words],
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            ref_path = os.path.join(tmp, "reference.wav")
-            with open(ref_path, "wb") as fh:
-                fh.write(audio_util.encode_wav(reference, profile.sample_rate))
-            samples = self._cloner.synthesize(text, target_language, ref_path)
-        return samples, self._cloner.sample_rate
+            ref_paths = []
+            for i, clip in enumerate(clips):
+                path = os.path.join(tmp, f"reference-{i}.wav")
+                with open(path, "wb") as fh:
+                    fh.write(audio_util.encode_wav(clip, profile.sample_rate))
+                ref_paths.append(path)
+            refs = ref_paths[0] if len(ref_paths) == 1 else ref_paths
+            samples = self._cloner.synthesize(text, target_language, refs)
+
+        rate = self._cloner.sample_rate
+        samples = self._match_speaker(samples, rate, profile.stats)
+        return samples, rate
+
+    @staticmethod
+    def _match_speaker(samples: np.ndarray, rate: int,
+                       stats: "audio_util.VoiceStats") -> np.ndarray:
+        """Gently pull the clone toward the speaker's own pitch and loudness.
+
+        XTTS is already close, so this is a light correction, not a heavy
+        transform: pitch is only nudged when it has drifted more than ~8% (and
+        the shift is clamped tight to avoid artefacts), and loudness is matched
+        to the speaker's measured level. Same idea eSpeak uses, applied softly.
+        """
+        if samples.size == 0:
+            return samples
+        target_f0 = stats.median_f0
+        if target_f0 > 0:
+            produced = audio_util.estimate_f0(samples, rate)
+            if produced > 0:
+                ratio = target_f0 / produced
+                if abs(ratio - 1.0) > 0.08:
+                    samples = audio_util.pitch_shift(
+                        samples, rate, float(np.clip(ratio, 0.85, 1.18))
+                    )
+        if stats.speech_rms > 0:
+            samples = audio_util.match_loudness(samples, stats.speech_rms)
+        return samples
 
 
 class EspeakBackend(TtsBackend):
