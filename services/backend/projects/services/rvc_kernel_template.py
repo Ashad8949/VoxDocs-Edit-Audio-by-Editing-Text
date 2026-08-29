@@ -156,9 +156,16 @@ try:
     os.chdir(RVC_DIR)
     print("RVC repo top-level:", os.listdir("."), flush=True)
 
+    # P100-compatible torch first: the cu118 wheels bundle their own cudnn, so
+    # we avoid the repo requirements' pinned nvidia-cudnn-cu11 (not always on
+    # PyPI). Then install the rest best-effort (a single bad pin mustn't abort).
+    sh(f"{sys.executable} -m pip install -q torch torchaudio --index-url https://download.pytorch.org/whl/cu118")
     req = "requirments_cu118_py312.txt"
     if os.path.exists(req):
         subprocess.run(f"{sys.executable} -m pip install -q -r {req}", shell=True)
+    # The training scripts import the repo's top-level `infer` package, so the
+    # repo root must be on PYTHONPATH (python puts the script's own dir first).
+    os.environ["PYTHONPATH"] = RVC_DIR + os.pathsep + os.environ.get("PYTHONPATH", "")
 
     base = "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main"
     for asset, url in [
