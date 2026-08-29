@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
+import { QUALITY_TIERS } from '../api.js';
 
 /**
  * DubRenderPanel: Queue and monitor dubbed video rendering.
  */
 export default function DubRenderPanel({ projectId, translation }) {
   const [format, setFormat] = useState('mp4');
+  const [quality, setQuality] = useState('standard');
   const [dubRenders, setDubRenders] = useState([]);
   const [currentDub, setCurrentDub] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -63,7 +65,7 @@ export default function DubRenderPanel({ projectId, translation }) {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ format }),
+          body: JSON.stringify({ format, quality }),
         }
       );
 
@@ -129,6 +131,23 @@ export default function DubRenderPanel({ projectId, translation }) {
               {formats.map((fmt) => (
                 <option key={fmt.value} value={fmt.value}>
                   {fmt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="format-select">
+            <label htmlFor="voice-quality">Voice Quality:</label>
+            <select
+              id="voice-quality"
+              value={quality}
+              onChange={(e) => setQuality(e.target.value)}
+              disabled={loading}
+              title={QUALITY_TIERS.find((t) => t.value === quality)?.note}
+            >
+              {QUALITY_TIERS.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
                 </option>
               ))}
             </select>

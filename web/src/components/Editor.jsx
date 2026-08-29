@@ -42,6 +42,7 @@ export default function Editor({ projectId, onBack }) {
   const [renderStage, setRenderStage] = useState(null);
   const [result, setResult] = useState(null);
   const [format, setFormat] = useState('wav');
+  const [quality, setQuality] = useState('standard');
 
   // Renders completed this session, so the preview can play the edited
   // result directly instead of only offering it as a download; 'original'
@@ -275,7 +276,7 @@ export default function Editor({ projectId, onBack }) {
       const render = await api.renderEdit(
         projectId,
         tokens,
-        { format, video: Boolean(project.hasVideo) && format === 'video' },
+        { format, video: Boolean(project.hasVideo) && format === 'video', quality },
         (update) => setRenderStage(update.status)
       );
       setResult(render);
@@ -508,6 +509,15 @@ export default function Editor({ projectId, onBack }) {
         </div>
         <div className="grow" />
 
+        <select
+          value={quality}
+          onChange={(e) => setQuality(e.target.value)}
+          title={api.QUALITY_TIERS.find((t) => t.value === quality)?.note}
+        >
+          {api.QUALITY_TIERS.map((t) => (
+            <option key={t.value} value={t.value}>{t.label}</option>
+          ))}
+        </select>
         <select value={format} onChange={(e) => setFormat(e.target.value)}>
           <option value="wav">WAV</option>
           <option value="mp3">MP3</option>

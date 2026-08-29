@@ -194,6 +194,7 @@ def perform_render(render: Render) -> Render:
             "context_after": segment.context_after,
             "lead_gap": segment.lead_gap,
             "trail_gap": segment.trail_gap,
+            "quality": render.quality,
         })
 
     synthesis: dict[int, dict] = {}

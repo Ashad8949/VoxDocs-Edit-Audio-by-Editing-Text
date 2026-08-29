@@ -20,9 +20,9 @@ from flask import Flask, jsonify, request
 from . import audio as audio_util
 from .asr import ASR_SAMPLE_RATE, select_backend
 from .store import ProfileStore
-from .synth import ProfileWord, Synthesizer, VoiceProfile
+from .synth import DEFAULT_TIER, ProfileWord, Synthesizer, VoiceProfile
 from .translate import IndicTrans2Translator
-from .voice_clone import XttsVoiceCloner, trim_reference
+from .voice_clone import XttsVoiceCloner
 
 log = logging.getLogger(__name__)
 
@@ -118,78 +118,6 @@ def _generate_speaker_embedding(samples: np.ndarray, sr: int = 16000) -> list[fl
         return embedding[:192]
     except Exception:
         return [0.0] * 192
-
-
-def _synthesize_with_fallback(text: str, target_language: str,
-                              context_before: str = "", context_after: str = "") -> np.ndarray | None:
-    """Fallback synthesis using eSpeak when voice profile is unavailable.
-    
-    Generates speech but without voice characteristics.
-    """
-    try:
-        import subprocess
-        import tempfile
-        
-        # Use eSpeak for basic synthesis
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            output_file = tmp.name
-        
-        # Map target language to eSpeak language code
-        lang_map = {
-            "en": "en",
-            "hi": "hi",
-            "hinglish": "en",  # Use English for Hinglish
-        }
-        lang_code = lang_map.get(target_language, "en")
-        
-        # Run eSpeak
-        cmd = [
-            "espeak-ng",
-            "-v", lang_code,
-            "-w", output_file,
-            text
-        ]
-        subprocess.run(cmd, capture_output=True, timeout=5)
-        
-        # Load synthesized audio
-        if os.path.exists(output_file):
-            samples = audio_util.decode(output_file, sample_rate=22050)
-            try:
-                os.remove(output_file)
-            except OSError:
-                pass
-            return samples
-        return None
-    except Exception as exc:
-        log.warning("fallback synthesis failed: %s", exc)
-        return None
-
-
-def _synthesize_with_voice_profile(voice_cloner, profile: VoiceProfile, text: str,
-                                   target_language: str) -> tuple[np.ndarray, int] | None:
-    """Synthesize text in the profile's speaker's voice via XTTS-v2,
-    using the project's own cached source audio as the reference clip.
-
-    Returns None (rather than raising) whenever cloning isn't possible —
-    no cached audio, or the cloner isn't available — so the caller can fall
-    back to generic synthesis without special-casing every reason why.
-    """
-    if profile.samples is None or not voice_cloner.available():
-        return None
-
-    reference = trim_reference(profile.samples, profile.sample_rate)
-    ref_bytes = audio_util.encode_wav(reference, sample_rate=profile.sample_rate)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(ref_bytes)
-        ref_path = tmp.name
-    try:
-        samples = voice_cloner.synthesize(text, target_language, ref_path)
-        return samples, voice_cloner.sample_rate
-    finally:
-        try:
-            os.remove(ref_path)
-        except OSError:
-            pass
 
 
 def create_app() -> Flask:
@@ -551,8 +479,7 @@ def create_app() -> Flask:
         project_id = str(payload.get("project_id") or "")
         text = str(payload.get("text") or "")
         target_language = str(payload.get("target_language") or "en")
-        context_before = str(payload.get("context_before") or "")
-        context_after = str(payload.get("context_after") or "")
+        tier = str(payload.get("quality") or DEFAULT_TIER)
 
         if not project_id:
             return jsonify({
@@ -567,48 +494,42 @@ def create_app() -> Flask:
                 "word": text
             })
 
+        profile = store.get(project_id)
+        if profile is None:
+            return jsonify({
+                "error": "voice_profile_missing",
+                "project_id": project_id,
+                "message": "re-seed the profile via POST /voice-profile and retry",
+            }), 409
+
         try:
-            # Try real voice-cloned synthesis first, using the project's own
-            # cached source audio as the reference clip; fall back to a
-            # generic voice whenever that isn't possible for any reason.
-            profile = store.get(project_id)
-            result = None
-            if profile is not None:
-                try:
-                    result = _synthesize_with_voice_profile(voice_cloner, profile, text, target_language)
-                except Exception:
-                    log.exception("voice-cloned synthesis failed for %s; falling back", project_id)
-                    result = None
-
-            if result is not None:
-                audio_data, sample_rate = result
-                voice_cloned = True
-            else:
-                audio_data = _synthesize_with_fallback(
-                    text, target_language, context_before, context_after
-                )
-                sample_rate = 22050
-                voice_cloned = False
-
-            if audio_data is not None:
-                # Encode as base64 WAV
-                audio_bytes = audio_util.encode_wav(audio_data, sample_rate=sample_rate)
-                audio_b64 = base64.b64encode(audio_bytes).decode('ascii')
-                return jsonify({
-                    "type": "audio",
-                    "data": audio_b64,
-                    "word": text,
-                    "sample_rate": sample_rate,
-                    "voice_cloned": voice_cloned,
-                    "confidence": 0.9 if voice_cloned else 0.5
-                })
-            else:
+            # One unified path: the chosen tier's engine chain regenerates the
+            # whole segment as one cross-lingual utterance, falling through to
+            # eSpeak so a dub segment is never silently dropped.
+            produced = synthesizer.clone_phrase(profile, text, tier, target_language)
+            if produced is None:
                 return jsonify({
                     "type": "audio",
                     "data": None,
                     "word": text,
-                    "error": "synthesis_failed"
+                    "error": "synthesis_failed",
                 }), 500
+
+            samples, sample_rate, engine = produced
+            audio_bytes = audio_util.encode_wav(samples, sample_rate=sample_rate)
+            audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+            # "cloned" = came from a real voice-cloning engine, not the eSpeak
+            # formant fallback; the client uses this to warn on low fidelity.
+            voice_cloned = engine not in ("espeak-ng",)
+            return jsonify({
+                "type": "audio",
+                "data": audio_b64,
+                "word": text,
+                "sample_rate": sample_rate,
+                "engine": engine,
+                "voice_cloned": voice_cloned,
+                "confidence": 0.9 if voice_cloned else 0.5,
+            })
         except Exception as exc:
             log.exception("voice synthesis failed for %s", project_id)
             return jsonify({
@@ -643,6 +564,7 @@ def create_app() -> Flask:
             context_after=payload.get("context_after"),
             lead_gap=float(payload.get("lead_gap") or 0.0),
             trail_gap=float(payload.get("trail_gap") or 0.0),
+            tier=str(payload.get("quality") or DEFAULT_TIER),
         )
         return jsonify(result.to_json())
 
@@ -661,6 +583,10 @@ def create_app() -> Flask:
                 "message": "re-seed the profile via POST /voice-profile and retry",
             }), 409
 
+        # A batch is one render, so its tier is uniform; take it from the top
+        # level, falling back to the first item for older callers.
+        batch_tier = str(payload.get("quality") or (items[0].get("quality") if items else None) or DEFAULT_TIER)
+
         results = []
         for item in items:
             text = str(item.get("text") or "")
@@ -675,6 +601,7 @@ def create_app() -> Flask:
                 context_after=item.get("context_after"),
                 lead_gap=float(item.get("lead_gap") or 0.0),
                 trail_gap=float(item.get("trail_gap") or 0.0),
+                tier=str(item.get("quality") or batch_tier),
             )
             results.append(result.to_json())
         return jsonify({"project_id": project_id, "results": results})

@@ -167,6 +167,9 @@ class Render(models.Model):
     tokens = models.JSONField(default=list)
     format = models.CharField(max_length=8, default="wav")
     with_video = models.BooleanField(default=False)
+    # Voice-quality tier chosen for this render (free/standard/pro/studio);
+    # selects which synthesis engine the model server uses.
+    quality = models.CharField(max_length=16, default="standard")
 
     file = models.CharField(max_length=255, blank=True, default="")
     bytes = models.BigIntegerField(default=0)
@@ -260,7 +263,9 @@ class DubRender(models.Model):
 
     # Output format: mp4, webm, etc.
     format = models.CharField(max_length=8, default="mp4")
-    
+    # Voice-quality tier chosen for this dub (free/standard/pro/studio).
+    quality = models.CharField(max_length=16, default="standard")
+
     # Final dubbed video file
     file = models.CharField(max_length=255, blank=True, default="")
     bytes = models.BigIntegerField(default=0)

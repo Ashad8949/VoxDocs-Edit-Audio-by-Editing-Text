@@ -41,7 +41,7 @@ def perform_dub_render(dub_render: DubRender) -> DubRender:
     try:
         # Synthesize only the changed segments
         synthesis_result = _synthesize_dubbed_segments(
-            project, translation, edl["replace_text"]
+            project, translation, edl["replace_text"], dub_render.quality
         )
 
         # Build audio render ops from the EDL. Every op is locked to its
@@ -94,6 +94,7 @@ def _synthesize_dubbed_segments(
     project: Project,
     translation: Translation,
     replace_text: dict[int, str],
+    quality: str = "standard",
 ) -> dict:
     """Synthesize only the segments that changed.
     
@@ -137,6 +138,7 @@ def _synthesize_dubbed_segments(
             target_language=target_language,
             context_before=context_before,
             context_after=context_after,
+            quality=quality,
         )
         
         synthesis[seg_index] = result

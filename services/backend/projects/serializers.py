@@ -36,7 +36,7 @@ class RenderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Render
         fields = (
-            "id", "status", "error", "format", "file", "bytes", "duration",
+            "id", "status", "error", "format", "quality", "file", "bytes", "duration",
             "pieces", "stats", "warnings", "synthesis", "createdAt", "downloadUrl",
         )
 
@@ -108,6 +108,7 @@ class EditRequestSerializer(serializers.Serializer):
     text = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
     format = serializers.CharField(required=False, default="wav")
     video = serializers.BooleanField(required=False, default=False)
+    quality = serializers.CharField(required=False, default="standard")
     includeSegments = serializers.BooleanField(required=False, default=False)
     includeTokens = serializers.BooleanField(required=False, default=False)
 

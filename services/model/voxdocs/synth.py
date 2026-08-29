@@ -298,7 +298,8 @@ class TtsBackend:
     def available(self) -> bool:
         return False
 
-    def synthesize(self, text: str, profile: VoiceProfile) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str, profile: VoiceProfile,
+                   target_language: str = "en") -> tuple[np.ndarray, int]:
         raise NotImplementedError
 
 
@@ -342,11 +343,15 @@ class PaddleSpeechBackend(TtsBackend):
                     self._vector = VectorExecutor()
         return self._executor, self._vector
 
-    def synthesize(self, text: str, profile: VoiceProfile) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str, profile: VoiceProfile,
+                   target_language: str = "en") -> tuple[np.ndarray, int]:
         executor, vector = self._load()
         if profile.samples is None:
             raise RuntimeError("voice cloning needs the source audio; none was cached")
 
+        # PaddleSpeech's mixed acoustic model covers en/zh; anything else it
+        # can't speak natively falls back to the configured default lang.
+        lang = {"en": "en", "hi": "mix", "hinglish": "mix"}.get(target_language, self.lang)
         with tempfile.TemporaryDirectory() as tmp:
             reference = os.path.join(tmp, "reference.wav")
             output = os.path.join(tmp, "out.wav")
@@ -360,7 +365,7 @@ class PaddleSpeechBackend(TtsBackend):
                 output=output,
                 am=self.am,
                 voc=self.voc,
-                lang=self.lang,
+                lang=lang,
                 spk_emb=embedding,
             )
             samples = audio_util.decode(output, profile.sample_rate)
@@ -385,7 +390,8 @@ class XttsBackend(TtsBackend):
     def available(self) -> bool:
         return self._cloner.available()
 
-    def synthesize(self, text: str, profile: VoiceProfile) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str, profile: VoiceProfile,
+                   target_language: str = "en") -> tuple[np.ndarray, int]:
         if profile.samples is None:
             raise RuntimeError("voice cloning needs the source audio; none was cached")
 
@@ -394,7 +400,7 @@ class XttsBackend(TtsBackend):
             ref_path = os.path.join(tmp, "reference.wav")
             with open(ref_path, "wb") as fh:
                 fh.write(audio_util.encode_wav(reference, profile.sample_rate))
-            samples = self._cloner.synthesize(text, "en", ref_path)
+            samples = self._cloner.synthesize(text, target_language, ref_path)
         return samples, self._cloner.sample_rate
 
 
@@ -410,15 +416,21 @@ class EspeakBackend(TtsBackend):
     def available(self) -> bool:
         return shutil.which("espeak-ng") is not None or shutil.which("espeak") is not None
 
-    def synthesize(self, text: str, profile: VoiceProfile) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str, profile: VoiceProfile,
+                   target_language: str = "en") -> tuple[np.ndarray, int]:
         binary = shutil.which("espeak-ng") or shutil.which("espeak")
         if not binary:
             raise RuntimeError("espeak-ng is not installed")
 
         target_f0 = profile.stats.median_f0
-        # A higher-pitched speaker gets a voice variant closer to their register,
-        # which leaves less work for the pitch shifter and sounds less artefacty.
-        voice = "en-us+f3" if target_f0 >= 165 else "en-us"
+        if target_language in ("hi", "hinglish"):
+            # eSpeak has a Hindi voice but no gendered +fN variants for it.
+            voice = "hi"
+        else:
+            # A higher-pitched speaker gets a voice variant closer to their
+            # register, which leaves less work for the pitch shifter and sounds
+            # less artefacty.
+            voice = "en-us+f3" if target_f0 >= 165 else "en-us"
         words_per_minute = int(np.clip(60.0 / max(profile.sec_per_word, 0.12), 110, 260))
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -444,6 +456,43 @@ class EspeakBackend(TtsBackend):
 
 
 # --------------------------------------------------------------------------
+# Quality tiers
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TierConfig:
+    """One subscription quality level.
+
+    ``engines`` is the ordered generative-engine chain tried for words the
+    source never spoke; the first *available* one that produces audio wins,
+    so higher tiers simply list better engines first and fall through to the
+    same safety net. ``postprocess`` pitch/loudness-matches the generated
+    audio toward the speaker (wired in Phase 1; eSpeak already self-matches).
+    """
+
+    engines: tuple[str, ...]
+    postprocess: bool = False
+
+
+# Engine names refer to TtsBackend.name. "rvc" and "xtts-ft" are future
+# (Pro/Studio) engines that are not registered yet — listing them here is
+# deliberate: until they exist those tiers transparently fall through to
+# XTTS, so selecting Pro today behaves like Standard rather than erroring.
+TIERS: dict[str, TierConfig] = {
+    "free":     TierConfig(("espeak-ng",)),
+    "standard": TierConfig(("xtts", "paddlespeech", "espeak-ng"), postprocess=True),
+    "pro":      TierConfig(("rvc", "xtts", "paddlespeech", "espeak-ng"), postprocess=True),
+    "studio":   TierConfig(("xtts-ft", "xtts", "paddlespeech", "espeak-ng"), postprocess=True),
+}
+DEFAULT_TIER = "standard"
+
+
+def resolve_tier(tier: str | None) -> str:
+    """Normalise an untrusted tier string to a known one."""
+    return tier if tier in TIERS else DEFAULT_TIER
+
+
+# --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
 
@@ -458,6 +507,7 @@ class Synthesizer:
             PaddleSpeechBackend(),
             EspeakBackend(),
         ]
+        self._by_name = {b.name: b for b in self.tts_backends}
 
     def describe(self) -> dict:
         return {
@@ -466,33 +516,70 @@ class Synthesizer:
                 {"name": b.name, "available": b.available()}
                 for b in self.tts_backends
             ],
+            "tiers": {
+                name: {
+                    # The engine each tier actually resolves to right now,
+                    # after skipping unbuilt (rvc/xtts-ft) and unavailable ones.
+                    "engine": next(
+                        (e for e in cfg.engines
+                         if e in self._by_name and self._by_name[e].available()),
+                        None,
+                    ),
+                    "postprocess": cfg.postprocess,
+                }
+                for name, cfg in TIERS.items()
+            },
         }
 
-    def _tts(self, text: str, profile: VoiceProfile) -> tuple[Unit | None, str]:
-        for backend in self.tts_backends:
-            if not backend.available():
+    def _run_tier(self, text: str, profile: VoiceProfile, tier: str,
+                  target_language: str) -> tuple[np.ndarray, int, str] | None:
+        """Walk a tier's engine chain, returning the first engine's
+        (samples, sample_rate, engine_name) or None if none produced audio.
+        """
+        config = TIERS[resolve_tier(tier)]
+        for name in config.engines:
+            backend = self._by_name.get(name)
+            if backend is None or not backend.available():
                 continue
             try:
-                samples, rate = backend.synthesize(text, profile)
+                samples, rate = backend.synthesize(text, profile, target_language)
             except Exception as exc:  # a broken backend must not sink the request
-                log.warning("tts backend %s failed: %s", backend.name, exc)
+                log.warning("tts backend %s failed: %s", name, exc)
                 continue
             if samples.size == 0:
                 continue
-            return Unit(
-                type="audio",
-                word=text,
-                sample_rate=rate,
-                data=audio_util.encode_wav(samples, rate),
-                origin=backend.name,
-            ), backend.name
-        return None, ""
+            return samples, rate, backend.name
+        return None
+
+    def clone_phrase(self, profile: VoiceProfile, text: str,
+                     tier: str = DEFAULT_TIER,
+                     target_language: str = "en") -> tuple[np.ndarray, int, str] | None:
+        """Generative-only synthesis of a whole phrase in the speaker's voice
+        for the given tier — no voice-bank splicing. Used by dubbing, where a
+        segment is regenerated as one continuous cross-lingual utterance.
+        """
+        return self._run_tier(text, profile, tier, target_language)
+
+    def _tts(self, text: str, profile: VoiceProfile, tier: str,
+             target_language: str = "en") -> tuple[Unit | None, str]:
+        produced = self._run_tier(text, profile, tier, target_language)
+        if produced is None:
+            return None, ""
+        samples, rate, name = produced
+        return Unit(
+            type="audio",
+            word=text,
+            sample_rate=rate,
+            data=audio_util.encode_wav(samples, rate),
+            origin=name,
+        ), name
 
     def synthesize(self, profile: VoiceProfile, text: str,
                    context_before: str | None = None,
                    context_after: str | None = None,
                    lead_gap: float = 0.0,
-                   trail_gap: float = 0.0) -> SynthesisResult:
+                   trail_gap: float = 0.0,
+                   tier: str = DEFAULT_TIER) -> SynthesisResult:
         phrase = tokenize(text)
         if not phrase:
             return SynthesisResult([], [], [], [], [])
@@ -526,7 +613,7 @@ class Synthesizer:
             # voice carrying the *whole* phrase in one continuous pass keeps
             # prosody smooth; that only costs something when nothing needs
             # synthesis at all, which is the branch above.
-            unit, backend = self._tts(text, profile)
+            unit, backend = self._tts(text, profile, tier)
             if unit is not None:
                 units.append(unit)
                 generated = list(phrase)

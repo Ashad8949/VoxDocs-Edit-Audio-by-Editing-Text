@@ -166,12 +166,13 @@ def extract_voice_profile(project_id: str, audio_path: Path) -> dict:
 
 
 def synthesize_with_voice(project_id: str, text: str, target_language: str,
-                          context_before: str = "", context_after: str = "") -> dict:
+                          context_before: str = "", context_after: str = "",
+                          quality: str = "standard") -> dict:
     """Synthesize text using the project's extracted voice profile.
-    
+
     This differs from batch synthesis in that it specifically targets
     the speaker's voice for multilingual synthesis.
-    
+
     Returns:
     - type: "audio" or "source" (reuse of original)
     - data: base64 encoded WAV if type=="audio"
@@ -184,6 +185,7 @@ def synthesize_with_voice(project_id: str, text: str, target_language: str,
         "target_language": target_language,
         "context_before": context_before,
         "context_after": context_after,
+        "quality": quality,
     }
     response = _request("POST", "/synthesize/voice", json=payload)
     if not response.ok:

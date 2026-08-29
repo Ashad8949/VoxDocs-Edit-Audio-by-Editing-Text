@@ -348,9 +348,10 @@ def project_render(request, project_id: str):
         raise pipeline.ValidationError(f'unsupported format "{fmt}" (use wav, mp3 or m4a)')
 
     tokens = pipeline.resolve_tokens(project, request.data)
+    quality = (body.validated_data.get("quality") or "standard").lower()
     render = Render.objects.create(
         project=project, tokens=tokens, format=fmt, with_video=want_video,
-        status=Render.Status.PENDING,
+        quality=quality, status=Render.Status.PENDING,
     )
     async_result = render_edit.delay(render.id)
     Render.objects.filter(pk=render.id).update(task_id=async_result.id)
@@ -572,9 +573,11 @@ def translation_dub_render(request, project_id: str, translation_id: str):
             status=400,
         )
 
+    quality = str(request.data.get("quality") or "standard").lower()
     dub_render = DubRender.objects.create(
         translation=translation,
         format=output_format,
+        quality=quality,
         status=DubRender.Status.PENDING,
     )
 

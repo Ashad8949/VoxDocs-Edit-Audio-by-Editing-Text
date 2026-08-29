@@ -84,8 +84,8 @@ export const planEdit = (id, tokens) => request(`/api/projects/${id}/plan`, json
  * Queue a render. The backend answers 202 immediately and does the work on a
  * Celery worker, so this returns the pending render plus where to poll it.
  */
-export const queueRender = (id, tokens, { format = 'wav', video = false } = {}) =>
-  request(`/api/projects/${id}/render`, json({ tokens, format, video }));
+export const queueRender = (id, tokens, { format = 'wav', video = false, quality = 'standard' } = {}) =>
+  request(`/api/projects/${id}/render`, json({ tokens, format, video, quality }));
 
 export const getRender = (projectId, renderId) =>
   request(`/api/projects/${projectId}/renders/${renderId}/status`).then((b) => b.render);
@@ -101,8 +101,8 @@ export const getRender = (projectId, renderId) =>
  * @param {{ signal?: AbortSignal, intervalMs?: number }} [options]
  */
 export async function renderEdit(projectId, tokens, options = {}, onProgress) {
-  const { format, video, signal, intervalMs = 1000 } = options;
-  const queued = await queueRender(projectId, tokens, { format, video });
+  const { format, video, quality, signal, intervalMs = 1000 } = options;
+  const queued = await queueRender(projectId, tokens, { format, video, quality });
   let render = queued.render;
   onProgress?.(render);
 
@@ -119,6 +119,18 @@ export async function renderEdit(projectId, tokens, options = {}, onProgress) {
   }
   return render;
 }
+
+/**
+ * Voice-quality tiers (subscription levels). `value` is the string the API
+ * expects; `note` explains the trade-off. Pro/Studio need a trained voice
+ * model (not built yet) — until then they transparently behave like Standard.
+ */
+export const QUALITY_TIERS = [
+  { value: 'free', label: 'Free — robotic voice', note: 'Fast, generic formant voice (eSpeak).' },
+  { value: 'standard', label: 'Standard — voice clone', note: "Clones the speaker's voice (XTTS)." },
+  { value: 'pro', label: 'Pro — enhanced clone', note: 'Closer timbre match (RVC). Coming soon.' },
+  { value: 'studio', label: 'Studio — trained voice', note: 'Best match, per-speaker model. Coming soon.' },
+];
 
 export const mediaUrl = (id) => `/api/projects/${id}/media`;
 
