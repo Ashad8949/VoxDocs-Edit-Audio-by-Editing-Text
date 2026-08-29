@@ -116,8 +116,12 @@ model_out = os.path.join(WORK, "model.pth")
 index_out = os.path.join(WORK, "added.index")
 trained = False
 try:
+    # No --recurse-submodules: the repo's realtime-VST submodule drags in a
+    # huge tree of C++ audio-plugin SDKs we don't need (and which blows up the
+    # clone). The Python training scripts live in the main repo's infer/ tree,
+    # which the glob below locates.
     subprocess.run(
-        f"git clone --depth 1 --recurse-submodules "
+        f"git clone --depth 1 "
         f"https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI {RVC_DIR}",
         shell=True, check=True)
     os.chdir(RVC_DIR)
