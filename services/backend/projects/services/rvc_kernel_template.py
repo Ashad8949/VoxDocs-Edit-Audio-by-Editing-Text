@@ -50,8 +50,10 @@ EPOCHS = __EPOCHS__
 SR = __SR__
 EVAL_TEXT = "__EVAL_TEXT__"
 
-WORK = "/kaggle/working"
-EXP = os.path.join(WORK, "exp")
+WORK = "/kaggle/working"      # only small final artifacts go here (it's the output)
+SCRATCH = "/tmp/voxdocs"      # heavy intermediates (repo, separation, features)
+os.makedirs(SCRATCH, exist_ok=True)
+EXP = os.path.join(SCRATCH, "exp")
 os.makedirs(EXP, exist_ok=True)
 
 
@@ -87,7 +89,7 @@ DEVICE = "cpu"
 
 # --- 2. Data prep: vocal separation (Demucs, CPU) --------------------------
 # Isolate the speaker's voice from any music/background so RVC trains clean.
-sep_dir = os.path.join(WORK, "sep")
+sep_dir = os.path.join(SCRATCH, "sep")
 os.makedirs(sep_dir, exist_ok=True)
 try:
     sh(f"{sys.executable} -m demucs -d cpu --two-stems vocals -o {sep_dir} \"{raw}\"")
@@ -111,7 +113,7 @@ sf.write(real_holdout, holdout_y, SR)
 # --- 3. RVC training -------------------------------------------------------
 # Canonical RVC-Project flow: preprocess -> extract F0/features -> train ->
 # build faiss index. CLI arg shapes vary by RVC fork; iterate against logs.
-RVC_DIR = os.path.join(WORK, "rvc")
+RVC_DIR = os.path.join(SCRATCH, "rvc")
 model_out = os.path.join(WORK, "model.pth")
 index_out = os.path.join(WORK, "added.index")
 trained = False

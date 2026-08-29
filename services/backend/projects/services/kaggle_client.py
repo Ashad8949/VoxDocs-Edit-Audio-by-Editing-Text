@@ -160,11 +160,18 @@ def kernel_wait(ref: str, poll_seconds: float = 30.0, timeout_seconds: float = 3
         time.sleep(poll_seconds)
 
 
-def kernel_output(ref: str, dest: Path) -> None:
-    """Download the kernel's output files into `dest`."""
+def kernel_output(ref: str, dest: Path, attempts: int = 3) -> None:
+    """Download the kernel's output files into `dest`, retrying transient
+    network drops (large pulls over a flaky link can abort mid-stream)."""
     api = _client()
     dest.mkdir(parents=True, exist_ok=True)
-    try:
-        api.kernels_output(ref, str(dest))
-    except Exception as exc:  # noqa: BLE001
-        raise KaggleError(f"kernel output pull failed: {exc}") from exc
+    last = None
+    for i in range(attempts):
+        try:
+            api.kernels_output(ref, str(dest))
+            return
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            log.warning("kernel output pull attempt %d/%d failed: %s", i + 1, attempts, exc)
+            time.sleep(5)
+    raise KaggleError(f"kernel output pull failed after {attempts} attempts: {last}")
