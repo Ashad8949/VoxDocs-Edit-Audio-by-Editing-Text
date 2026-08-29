@@ -42,7 +42,11 @@ def train(model: VoiceModel) -> VoiceModel:
     if not project.master_path.exists():
         raise FileNotFoundError(f"master audio missing for {project.id}")
 
-    slug = f"voxdocs-{project.id}".lower()
+    # The dataset is versioned per project (the data-versioning story); each
+    # training run gets its own kernel slug so concurrent/retried runs never
+    # collide (Kaggle 409s a push to a kernel that is still running).
+    dataset_slug = f"voxdocs-{project.id}".lower()
+    kernel_slug = f"voxdocs-{project.id}-v{model.version}".lower()
     work = Path(tempfile.mkdtemp(prefix="voxdocs-train-"))
     try:
         # 1. Data ingestion + versioning -----------------------------------
@@ -50,7 +54,7 @@ def train(model: VoiceModel) -> VoiceModel:
         data_dir = work / "data"
         data_dir.mkdir()
         shutil.copy(project.master_path, data_dir / "speaker.wav")
-        dataset_ref = kaggle_client.dataset_push(data_dir, slug, f"VoxDocs {project.id} voice")
+        dataset_ref = kaggle_client.dataset_push(data_dir, dataset_slug, f"VoxDocs {project.id} voice")
 
         # 2. Training job (Kaggle GPU kernel) ------------------------------
         _set(model, status=VoiceModel.Status.TRAINING, kaggle_dataset=dataset_ref)
@@ -62,7 +66,7 @@ def train(model: VoiceModel) -> VoiceModel:
             encoding="utf-8",
         )
         kernel_ref = kaggle_client.kernel_push(
-            kernel_dir / "kernel.py", slug, f"VoxDocs train {project.id}", dataset_ref)
+            kernel_dir / "kernel.py", kernel_slug, f"VoxDocs train {project.id} v{model.version}", dataset_ref)
         _set(model, kaggle_kernel=kernel_ref)
 
         outcome = kaggle_client.kernel_wait(
