@@ -170,6 +170,12 @@ VOXDOCS = {
     "FFMPEG": os.environ.get("VOXDOCS_FFMPEG", "ffmpeg"),
     "FFPROBE": os.environ.get("VOXDOCS_FFPROBE", "ffprobe"),
     "ENVELOPE_FPS": 100,
+    # Pro-tier RVC training (Kaggle GPU). A trained model is only promoted to
+    # serving if its speaker-similarity clears this bar — the evaluation gate.
+    "RVC_MIN_SIMILARITY": env_float("VOXDOCS_RVC_MIN_SIMILARITY", 0.80),
+    "RVC_EPOCHS": env_int("VOXDOCS_RVC_EPOCHS", 100),
+    "RVC_SAMPLE_RATE": env_int("VOXDOCS_RVC_SAMPLE_RATE", 40000),
+    "KAGGLE_KERNEL_TIMEOUT": env_float("VOXDOCS_KAGGLE_TIMEOUT", 60 * 60),
 }
 
 REST_FRAMEWORK = {

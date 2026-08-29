@@ -22,6 +22,7 @@ from .asr import ASR_SAMPLE_RATE, select_backend
 from .store import ProfileStore
 from .synth import DEFAULT_TIER, ProfileWord, Synthesizer, VoiceProfile
 from .translate import IndicTrans2Translator
+from . import voice_rvc
 from .voice_clone import XttsVoiceCloner
 
 log = logging.getLogger(__name__)
@@ -348,6 +349,37 @@ def create_app() -> Flask:
     @app.delete("/voice-profile/<project_id>")
     def delete_voice_profile(project_id: str):
         return jsonify({"deleted": store.drop(project_id)})
+
+    # -------------------------------------------------------- voice model (RVC)
+
+    @app.post("/voice-model/rvc")
+    def put_voice_model():
+        """Cache a promoted RVC model for a project so the Pro tier can serve
+        it. The backend uploads this after training passes the eval gate."""
+        project_id = request.form.get("project_id") or ""
+        if not project_id:
+            return jsonify({"error": "missing_project_id"}), 400
+        model = request.files.get("model")
+        if model is None:
+            return jsonify({"error": "missing_model"}), 400
+        index = request.files.get("index")
+        voice_rvc.store_model(
+            project_id,
+            model.read(),
+            index.read() if index is not None else None,
+        )
+        return jsonify({
+            "project_id": project_id,
+            "version": request.form.get("version") or "",
+            "cached": True,
+        })
+
+    @app.get("/voice-model/rvc/<project_id>")
+    def get_voice_model(project_id: str):
+        return jsonify({
+            "project_id": project_id,
+            "cached": voice_rvc.has_model(project_id),
+        })
 
     # ------------------------------------------------------------ translation
 

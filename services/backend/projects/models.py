@@ -320,3 +320,72 @@ class VoiceProfile(models.Model):
 
     def __str__(self) -> str:
         return f"VoiceProfile({self.project.id})"
+
+
+class VoiceModel(models.Model):
+    """A per-speaker voice-conversion model trained for a project (Pro tier).
+
+    This is the model registry: one row per training run, versioned, tracking
+    the full lifecycle from data upload through GPU training to an evaluation
+    gate and promotion. The trained artifacts (an RVC .pth weight file and its
+    .index retrieval file) live under the project's media directory; the row
+    records where they are, how they were made, and how well they scored.
+    """
+
+    class Kind(models.TextChoices):
+        RVC = "rvc", "RVC voice conversion"
+        XTTS_FT = "xtts-ft", "Fine-tuned XTTS"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"          # row created, nothing done yet
+        UPLOADING = "uploading", "Uploading data"  # versioning the dataset
+        TRAINING = "training", "Training"        # Kaggle GPU kernel running
+        PULLING = "pulling", "Pulling artifacts"   # downloading kernel output
+        EVALUATING = "evaluating", "Evaluating"  # checking the similarity gate
+        READY = "ready", "Ready"                 # passed the gate, serving
+        REJECTED = "rejected", "Rejected"        # trained but below threshold
+        FAILED = "failed", "Failed"              # errored somewhere
+
+    id = models.CharField(primary_key=True, max_length=64, default=new_id, editable=False)
+    project = models.ForeignKey(Project, related_name="voice_models", on_delete=models.CASCADE)
+
+    kind = models.CharField(max_length=16, choices=Kind.choices, default=Kind.RVC)
+    version = models.IntegerField(default=1)
+    # Only one model per project serves at a time; promotion flips this.
+    is_active = models.BooleanField(default=False)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    error = models.TextField(blank=True, default="")
+
+    # Reproducibility: which versioned dataset + kernel produced this model.
+    kaggle_dataset = models.CharField(max_length=255, blank=True, default="")
+    kaggle_kernel = models.CharField(max_length=255, blank=True, default="")
+
+    # Trained artifacts, relative to this model's directory.
+    model_file = models.CharField(max_length=255, blank=True, default="")
+    index_file = models.CharField(max_length=255, blank=True, default="")
+
+    # Evaluation results, e.g. {"standard_similarity": 0.71, "pro_similarity": 0.88}.
+    metrics = models.JSONField(default=dict)
+
+    task_id = models.CharField(max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["project", "-created_at"])]
+
+    @property
+    def directory(self) -> Path:
+        return self.project.directory / "voice_models" / self.id
+
+    @property
+    def model_path(self) -> Path | None:
+        return self.directory / self.model_file if self.model_file else None
+
+    @property
+    def index_path(self) -> Path | None:
+        return self.directory / self.index_file if self.index_file else None
+
+    def __str__(self) -> str:
+        return f"VoiceModel({self.project_id} v{self.version} {self.kind} {self.status})"

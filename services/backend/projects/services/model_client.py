@@ -82,6 +82,25 @@ def transcribe(audio_path: Path, project_id: str, language: str | None = None) -
     return response.json()
 
 
+def upload_voice_model(project_id: str, version: int,
+                       model_path: Path, index_path: Path | None = None) -> dict:
+    """Ship a trained RVC model to the model server so it can serve the Pro
+    tier for this project. The server caches it to local disk keyed by
+    project_id, mirroring how voice profiles are cached."""
+    data = {"project_id": project_id, "version": str(version)}
+    files = {"model": ("model.pth", open(model_path, "rb"))}
+    if index_path is not None and Path(index_path).exists():
+        files["index"] = ("added.index", open(index_path, "rb"))
+    try:
+        response = _request("POST", "/voice-model/rvc", files=files, data=data)
+    finally:
+        for _, fh in files.values():
+            fh.close()
+    if not response.ok:
+        raise _raise_for(response)
+    return response.json()
+
+
 def put_voice_profile(project_id: str, words: list[dict], duration: float,
                       audio_path: Path | None = None) -> dict:
     """Re-seed a voice profile the model server has evicted."""

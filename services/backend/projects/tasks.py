@@ -96,6 +96,29 @@ def translate_project(self, translation_id: str) -> str:
         raise
 
 
+@shared_task(bind=True, name="projects.train_voice_model")
+def train_voice_model(self, voice_model_id: str) -> str:
+    """Train a per-speaker RVC model on Kaggle GPU and gate/promote it."""
+    try:
+        from .models import VoiceModel
+        model = VoiceModel.objects.select_related("project").get(pk=voice_model_id)
+    except Exception:
+        log.warning("train for unknown voice model %s; it was probably deleted", voice_model_id)
+        return "missing"
+
+    try:
+        from .services import voice_train
+        result = voice_train.train(model)
+        return result.status
+    except Exception as exc:
+        log.exception("voice-model training failed for %s", voice_model_id)
+        from .models import VoiceModel
+        VoiceModel.objects.filter(pk=voice_model_id).update(
+            status=VoiceModel.Status.FAILED, error=str(exc)[:2000]
+        )
+        raise
+
+
 @shared_task(bind=True, name="projects.extract_voice")
 def extract_voice(self, project_id: str) -> str:
     """Extract voice profile from project's original audio."""

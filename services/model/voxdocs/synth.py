@@ -45,6 +45,7 @@ import numpy as np
 
 from . import audio as audio_util
 from .voice_clone import XttsVoiceCloner, select_reference_clips
+from .voice_rvc import RvcConverter
 
 log = logging.getLogger(__name__)
 
@@ -443,6 +444,36 @@ class XttsBackend(TtsBackend):
         return samples
 
 
+class RvcBackend(TtsBackend):
+    """Pro tier: exact-speaker match via Retrieval-based Voice Conversion.
+
+    XTTS produces the words in an approximate clone; RVC then converts that
+    audio into the project speaker's *exact* timbre using a small model trained
+    on that speaker (see the backend's Kaggle training pipeline). Listed before
+    XTTS in the Pro chain, so it wins when a trained model exists — and cleanly
+    yields to XTTS when it doesn't: `convert` raises on a missing per-project
+    model, and `_run_tier` treats that as "try the next engine".
+    """
+
+    name = "rvc"
+
+    def __init__(self, xtts: "XttsBackend") -> None:
+        self._xtts = xtts
+        self._converter = RvcConverter()
+
+    def available(self) -> bool:
+        # Global availability only (the RVC lib is importable). Whether *this*
+        # project has a trained model is decided in synthesize(), which raises
+        # to fall through to XTTS when it doesn't.
+        return self._converter.available() and self._xtts.available()
+
+    def synthesize(self, text: str, profile: VoiceProfile,
+                   target_language: str = "en") -> tuple[np.ndarray, int]:
+        base, base_rate = self._xtts.synthesize(text, profile, target_language)
+        converted, rate = self._converter.convert(base, base_rate, profile.project_id)
+        return XttsBackend._match_speaker(converted, rate, profile.stats), rate
+
+
 class EspeakBackend(TtsBackend):
     """Formant synthesis, pitch- and level-matched to the speaker.
 
@@ -541,11 +572,18 @@ class Synthesizer:
     def __init__(self, enable_voice_bank: bool = True,
                  tts_backends: list[TtsBackend] | None = None) -> None:
         self.enable_voice_bank = enable_voice_bank
-        self.tts_backends = tts_backends if tts_backends is not None else [
-            XttsBackend(),
-            PaddleSpeechBackend(),
-            EspeakBackend(),
-        ]
+        if tts_backends is not None:
+            self.tts_backends = tts_backends
+        else:
+            xtts = XttsBackend()
+            # RvcBackend composes XTTS (XTTS generates, RVC re-timbres), so it
+            # shares the one XTTS instance rather than loading the model twice.
+            self.tts_backends = [
+                RvcBackend(xtts),
+                xtts,
+                PaddleSpeechBackend(),
+                EspeakBackend(),
+            ]
         self._by_name = {b.name: b for b in self.tts_backends}
 
     def describe(self) -> dict:

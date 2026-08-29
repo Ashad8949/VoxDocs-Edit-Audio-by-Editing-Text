@@ -43,5 +43,8 @@ urlpatterns = [
         "projects/<str:project_id>/translations/<str:translation_id>/dubs/<str:dub_render_id>/status",
         views.dub_render_status, name="dub-render-status",
     ),
+
+    # Pro-tier voice model (RVC training)
+    path("projects/<str:project_id>/voice-model", views.project_voice_model, name="project-voice-model"),
 ]
 

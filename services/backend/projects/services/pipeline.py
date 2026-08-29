@@ -272,6 +272,12 @@ def perform_render(render: Render) -> Render:
         render.stats = edl.stats.to_json()
         render.warnings = warnings
         render.synthesis = summarise_synthesis(synthesis)
+        # Observability: if RVC served this render, record which trained model
+        # version did, so a render is traceable back to the exact model.
+        if "rvc" in render.synthesis.get("backends", []):
+            active = project.voice_models.filter(is_active=True).first()
+            if active:
+                render.synthesis["voiceModelVersion"] = active.version
         render.error = ""
         render.save()
         return render

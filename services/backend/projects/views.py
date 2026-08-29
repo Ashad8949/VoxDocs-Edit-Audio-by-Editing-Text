@@ -667,3 +667,58 @@ def dub_render_download(request, project_id: str, translation_id: str, dub_rende
 
     return _serve_file(request, dub_render.path)
 
+
+# ------------------------------------------------------------- voice model
+
+
+def _voice_model_json(model) -> dict:
+    return {
+        "id": model.id,
+        "kind": model.kind,
+        "version": model.version,
+        "status": model.status,
+        "isActive": model.is_active,
+        "error": model.error,
+        "metrics": model.metrics,
+        "kaggleKernel": model.kaggle_kernel,
+        "createdAt": model.created_at.isoformat(),
+        "updatedAt": model.updated_at.isoformat(),
+    }
+
+
+@api_view(["GET", "POST"])
+def project_voice_model(request, project_id: str):
+    """GET the project's current Pro voice model; POST to train a new one."""
+    from .models import VoiceModel
+    from .tasks import train_voice_model
+
+    project = get_project(project_id)
+
+    if request.method == "GET":
+        model = project.voice_models.order_by("-created_at").first()
+        return Response({"voiceModel": _voice_model_json(model) if model else None})
+
+    require_ready(project)
+
+    # Don't stack training runs: if one is already in flight, return it.
+    active_states = [
+        VoiceModel.Status.PENDING, VoiceModel.Status.UPLOADING,
+        VoiceModel.Status.TRAINING, VoiceModel.Status.PULLING,
+        VoiceModel.Status.EVALUATING,
+    ]
+    in_flight = project.voice_models.filter(status__in=active_states).first()
+    if in_flight:
+        return Response({"voiceModel": _voice_model_json(in_flight)}, status=status.HTTP_202_ACCEPTED)
+
+    last = project.voice_models.order_by("-version").first()
+    model = VoiceModel.objects.create(
+        project=project,
+        kind=VoiceModel.Kind.RVC,
+        version=(last.version + 1) if last else 1,
+        status=VoiceModel.Status.PENDING,
+    )
+    async_result = train_voice_model.delay(model.id)
+    VoiceModel.objects.filter(pk=model.id).update(task_id=async_result.id)
+    model.refresh_from_db()
+    return Response({"voiceModel": _voice_model_json(model)}, status=status.HTTP_202_ACCEPTED)
+

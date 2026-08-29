@@ -14,3 +14,9 @@ sacremoses
 coqui-tts
 torchaudio
 torchcodec
+
+# Pro-tier RVC inference. Its fairseq dep needs Python <=3.11 (the container is
+# python:3.11-slim); on a newer local interpreter it won't install and the Pro
+# tier transparently falls through to XTTS. soundfile is used to pipe audio in/out.
+rvc-python; python_version < "3.12"
+soundfile

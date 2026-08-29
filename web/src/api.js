@@ -132,6 +132,13 @@ export const QUALITY_TIERS = [
   { value: 'studio', label: 'Studio — trained voice', note: 'Best match, per-speaker model. Coming soon.' },
 ];
 
+/** The project's current Pro voice model (or null), and a trigger to train one. */
+export const getVoiceModel = (id) =>
+  request(`/api/projects/${id}/voice-model`).then((b) => b.voiceModel);
+
+export const trainVoiceModel = (id) =>
+  request(`/api/projects/${id}/voice-model`, { method: 'POST' }).then((b) => b.voiceModel);
+
 export const mediaUrl = (id) => `/api/projects/${id}/media`;
 
 export const downloadUrl = (projectId, renderId) =>

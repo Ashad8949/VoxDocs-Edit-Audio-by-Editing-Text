@@ -6,3 +6,5 @@ redis>=5.0
 requests>=2.32
 gunicorn>=21.2
 psycopg[binary]>=3.1
+# Pro-tier voice-model training orchestration (Kaggle GPU kernels).
+kaggle>=1.6

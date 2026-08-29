@@ -15,6 +15,7 @@ import {
 } from '../lib/doc.js';
 import DubStudio from './DubStudio.jsx';
 import Transcript from './Transcript.jsx';
+import VoiceModelPanel from './VoiceModelPanel.jsx';
 import Waveform from './Waveform.jsx';
 
 const POLL_MS = 2000;
@@ -506,6 +507,11 @@ export default function Editor({ projectId, onBack }) {
           Click a word to select it, drag or shift-click for a phrase, then press
           <kbd>Delete</kbd>. Click between words and type to add new speech.
           <kbd>Space</kbd> plays, double-click a word to jump there.
+          {quality === 'pro' && (
+            <div className="pro-model-slot">
+              <VoiceModelPanel projectId={projectId} />
+            </div>
+          )}
         </div>
         <div className="grow" />
 
