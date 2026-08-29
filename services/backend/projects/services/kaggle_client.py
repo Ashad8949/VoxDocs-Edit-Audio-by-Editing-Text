@@ -112,9 +112,12 @@ def kernel_push(script_path: Path, slug: str, title: str, dataset_ref: str,
         resp = api.kernels_push(str(workdir))
     except Exception as exc:  # noqa: BLE001
         raise KaggleError(f"kernel push failed: {exc}") from exc
-    # Use the ref Kaggle actually assigned (it may normalise the slug) rather
-    # than the one we constructed, so status/output target the right kernel.
-    return getattr(resp, "ref", None) or ref
+    # Kaggle derives the real slug from the *title*, not our metadata id, and
+    # returns it as a URL path like "/code/user/slug". Normalise to the bare
+    # "user/slug" that kernels_status / kernels_output expect.
+    raw = getattr(resp, "ref", "") or ""
+    parts = [p for p in raw.strip("/").split("/") if p and p != "code"]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else ref
 
 
 def kernel_status(ref: str) -> str:

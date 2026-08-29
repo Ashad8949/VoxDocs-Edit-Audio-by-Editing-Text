@@ -117,41 +117,58 @@ index_out = os.path.join(WORK, "added.index")
 trained = False
 try:
     subprocess.run(
-        f"git clone --depth 1 https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI {RVC_DIR}",
+        f"git clone --depth 1 --recurse-submodules "
+        f"https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI {RVC_DIR}",
         shell=True, check=True)
-    files = os.listdir(RVC_DIR)
-    print("RVC repo top-level:", files, flush=True)
     os.chdir(RVC_DIR)
-    if os.path.exists("requirements.txt"):
-        sh(f"{sys.executable} -m pip install -q -r requirements.txt")
-    # Pretrained assets (hubert, rmvpe, base G/D). The repo ships a bash
-    # downloader; fall back to fetching the essentials directly.
-    if os.path.exists("tools/dlmodels.sh"):
-        subprocess.run("bash tools/dlmodels.sh", shell=True)
-    for asset, url in [
-        ("assets/hubert/hubert_base.pt",
-         "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt"),
-        ("assets/rmvpe/rmvpe.pt",
-         "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt"),
-    ]:
-        if not os.path.exists(asset):
-            os.makedirs(os.path.dirname(asset), exist_ok=True)
-            subprocess.run(f"wget -q -O {asset} {url}", shell=True)
+    print("RVC repo top-level:", os.listdir("."), flush=True)
 
-    EXP_NAME = "voxdocs_" + PROJECT_ID
-    sr_tag = "40k" if SR == 40000 else "48k"
-    sh(f"{sys.executable} infer/modules/train/preprocess.py {train_dir} {SR} 2 ./logs/{EXP_NAME} False 3.0")
-    sh(f"{sys.executable} infer/modules/train/extract/extract_f0_rmvpe.py 1 0 0 ./logs/{EXP_NAME} True")
-    sh(f"{sys.executable} infer/modules/train/extract_feature_print.py cuda:0 1 0 ./logs/{EXP_NAME} v2 True")
-    sh(f"{sys.executable} infer/modules/train/train.py -e {EXP_NAME} -sr {sr_tag} "
-       f"-f0 1 -bs 8 -te {EPOCHS} -se 50 -sw 1 -v v2 -l 0 -c 0")
-    subprocess.run(f"{sys.executable} infer/modules/train/train_index.py {EXP_NAME} v2", shell=True)
+    # The repo layout drifts between revisions, so locate the training entry
+    # points by name instead of hard-coding paths; skip RVC gracefully (the
+    # eval below still runs) if this revision doesn't ship them.
+    def find(name):
+        hits = glob.glob(f"./**/{name}", recursive=True)
+        return hits[0] if hits else None
 
-    for src in (glob.glob(f"./assets/weights/{EXP_NAME}*.pth")
-                + sorted(glob.glob(f"./logs/{EXP_NAME}/G_*.pth"))):
-        shutil.copy(src, model_out); trained = True; break
-    for src in glob.glob(f"./logs/{EXP_NAME}/added_*.index"):
-        shutil.copy(src, index_out); break
+    preprocess = find("preprocess.py")
+    extract_f0 = find("extract_f0_rmvpe.py")
+    extract_feat = find("extract_feature_print.py")
+    train_py = find("train.py")
+    print("RVC scripts:", preprocess, extract_f0, extract_feat, train_py, flush=True)
+
+    if all([preprocess, extract_f0, extract_feat, train_py]):
+        req = find("requirements.txt")
+        if req:
+            subprocess.run(f"{sys.executable} -m pip install -q -r {req}", shell=True)
+        for asset, url in [
+            ("assets/hubert/hubert_base.pt",
+             "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt"),
+            ("assets/rmvpe/rmvpe.pt",
+             "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt"),
+        ]:
+            if not os.path.exists(asset):
+                os.makedirs(os.path.dirname(asset), exist_ok=True)
+                subprocess.run(f"wget -q -O {asset} {url}", shell=True)
+
+        EXP_NAME = "voxdocs_" + PROJECT_ID
+        sr_tag = "40k" if SR == 40000 else "48k"
+        sh(f"{sys.executable} {preprocess} {train_dir} {SR} 2 ./logs/{EXP_NAME} False 3.0")
+        sh(f"{sys.executable} {extract_f0} 1 0 0 ./logs/{EXP_NAME} True")
+        sh(f"{sys.executable} {extract_feat} cuda:0 1 0 ./logs/{EXP_NAME} v2 True")
+        sh(f"{sys.executable} {train_py} -e {EXP_NAME} -sr {sr_tag} "
+           f"-f0 1 -bs 8 -te {EPOCHS} -se 50 -sw 1 -v v2 -l 0 -c 0")
+        idx = find("train_index.py")
+        if idx:
+            subprocess.run(f"{sys.executable} {idx} {EXP_NAME} v2", shell=True)
+
+        for src in (glob.glob(f"./assets/weights/{EXP_NAME}*.pth")
+                    + sorted(glob.glob(f"./logs/{EXP_NAME}/G_*.pth"))):
+            shutil.copy(src, model_out); trained = True; break
+        for src in glob.glob(f"./logs/{EXP_NAME}/added_*.index"):
+            shutil.copy(src, index_out); break
+    else:
+        print("RVC training scripts not found in this revision — skipping RVC; "
+              "eval will still report standard (zero-shot) similarity.", flush=True)
 except Exception as e:
     print("RVC training step failed:", repr(e), flush=True)
 finally:
